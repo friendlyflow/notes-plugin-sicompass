@@ -162,7 +162,7 @@ impl NotesProvider {
             loaded: false,
             error: None,
             announcement: None,
-            cloud: Cloud::default(),
+            cloud: Cloud::new(cloud::SERVICE),
             host,
         }
     }
@@ -377,7 +377,7 @@ impl NotesProvider {
         // place, whether or not the subscription is paid for. The notes
         // themselves are listed below it either way.
         if path.is_empty()
-            && let Some(row) = self.cloud.row(&*self.host)
+            && let Some(row) = cloud::row(&self.cloud, &*self.host)
         {
             out.push(row);
         }
@@ -472,7 +472,7 @@ impl NotesProvider {
             // subscription and with the user's language. No note can claim
             // that id: note ids are numbers, and `row_id` reads only the
             // prefix this plugin wrote.
-            if Cloud::is_row(&raw) {
+            if cloud::is_row(&raw) {
                 continue;
             }
             let text = row_text(&raw);
@@ -708,7 +708,7 @@ impl Plugin for NotesProvider {
             return false;
         }
         // The backup row is the switch's, in settings, not a note.
-        if Cloud::is_row(name) {
+        if cloud::is_row(name) {
             self.error = Some(localize::t("notes-error-cloud-row-undeletable"));
             return false;
         }
@@ -899,7 +899,7 @@ impl Plugin for NotesProvider {
         }
         self.ensure_loaded();
         if !self.tree.notes.is_empty() || self.load_failed {
-            self.error = Some(localize::t("notes-restore-refused"));
+            self.cloud.refuse_restore(&*self.host);
             return Ok(None);
         }
         self.cloud.start_restore(&*self.host);
@@ -917,9 +917,18 @@ impl Plugin for NotesProvider {
     fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
         let root = self.root().ok_or("the notes have no folder")?;
         let token = self.host.token();
+        let service = &cloud::SERVICE;
         match name {
-            cloud::TASK_BACKUP => cloud::run_backup(&root, input, token, &cloud::net_send),
-            cloud::TASK_RESTORE => cloud::run_restore(&root, token, &cloud::net_send),
+            cloud::TASK_BACKUP => sicompass_payments::cloud::run_backup(
+                service,
+                &root,
+                input,
+                token,
+                &cloud::net_send,
+            ),
+            cloud::TASK_RESTORE => {
+                sicompass_payments::cloud::run_restore(service, &root, token, &cloud::net_send)
+            }
             other => Err(format!("no task named `{other}`")),
         }
     }
@@ -928,7 +937,7 @@ impl Plugin for NotesProvider {
         let TaskEvent::Done(result) = event else {
             return;
         };
-        if self.cloud.on_task_done(id, result) == Finished::Restored {
+        if self.cloud.on_task_done(id, result, &*self.host) == Finished::Restored {
             // The tree in memory is stale: re-read what the task wrote.
             self.loaded = false;
             self.load_failed = false;
@@ -979,7 +988,7 @@ mod tests {
         }
     }
 
-    impl CloudHost for FakeHost {
+    impl cloud::Host for FakeHost {
         fn now_millis(&self) -> u64 {
             self.0.now.get()
         }
@@ -995,6 +1004,12 @@ mod tests {
             Ok(log.len() as u64)
         }
 
+        fn translate(&self, id: &str, args: &[(&str, String)]) -> String {
+            cloud::translate(id, args)
+        }
+    }
+
+    impl CloudHost for FakeHost {
         fn token(&self) -> Option<String> {
             self.0.token.borrow().clone()
         }
@@ -1862,6 +1877,16 @@ mod tests {
         assert!(label.contains("cloud"), "{label}");
     }
 
+    /// Every message the backup service can show, under this plugin's
+    /// prefix. A missing one would show as its id.
+    #[test]
+    fn every_cloud_message_resolves() {
+        for id in sicompass_payments::cloud::MESSAGES {
+            let id = format!("notes-{id}");
+            assert_ne!(localize::t(&id), id);
+        }
+    }
+
     /// The app skips `pop_path` when leaving an `Obj` keyed exactly `"meta"`,
     /// which would leave this provider's path a level deeper than the cursor.
     #[test]
@@ -1899,7 +1924,7 @@ mod tests {
         let FfonElement::Str(first) = &rendered[0] else {
             panic!("the cloud row is a plain row, not something to follow");
         };
-        assert!(Cloud::is_row(first), "{first}");
+        assert!(cloud::is_row(first), "{first}");
         assert!(!first.contains("<link>"), "{first}");
         assert!(labels(&rendered)[0].contains("store, tiers"), "{first}");
 
@@ -1951,7 +1976,7 @@ mod tests {
 
         // Exactly what the app hands back when the user changes nothing.
         let unchanged = rows(&mut p);
-        assert!(matches!(&unchanged[0], FfonElement::Str(s) if Cloud::is_row(s)));
+        assert!(matches!(&unchanged[0], FfonElement::Str(s) if cloud::is_row(s)));
         sync(&mut p, unchanged);
 
         assert_eq!(
@@ -2056,7 +2081,7 @@ mod tests {
         let mut p = provider(&dir);
         p.cloud.restore_enabled(true);
         assert!(p.take_announcement().is_none());
-        assert!(Cloud::is_row(&labels_raw(&rows(&mut p))[0]));
+        assert!(cloud::is_row(&labels_raw(&rows(&mut p))[0]));
     }
 
     /// The backup row is rendered by the plugin, not a note the user can
@@ -2244,7 +2269,14 @@ mod tests {
         let root = dir.path().join("notes");
 
         let (send, sent) = server(200, r#"{"stored":true}"#);
-        let hash = cloud::run_backup(&root, b"", Some("tok-42".to_owned()), &send).unwrap();
+        let hash = sicompass_payments::cloud::run_backup(
+            &cloud::SERVICE,
+            &root,
+            b"",
+            Some("tok-42".to_owned()),
+            &send,
+        )
+        .unwrap();
         assert!(!hash.is_empty());
         {
             let sent = sent.borrow();
@@ -2259,7 +2291,14 @@ mod tests {
         }
 
         // Unchanged since: no request at all.
-        let again = cloud::run_backup(&root, &hash, Some("tok-42".to_owned()), &send).unwrap();
+        let again = sicompass_payments::cloud::run_backup(
+            &cloud::SERVICE,
+            &root,
+            &hash,
+            Some("tok-42".to_owned()),
+            &send,
+        )
+        .unwrap();
         assert!(again.is_empty());
         assert_eq!(sent.borrow().len(), 1);
     }
@@ -2270,7 +2309,14 @@ mod tests {
         let mut p = provider(&dir);
         sync(&mut p, vec![new_row("milk")]);
         let (send, sent) = server(200, "{}");
-        let err = cloud::run_backup(&dir.path().join("notes"), b"", None, &send).unwrap_err();
+        let err = sicompass_payments::cloud::run_backup(
+            &cloud::SERVICE,
+            &dir.path().join("notes"),
+            b"",
+            None,
+            &send,
+        )
+        .unwrap_err();
         assert!(err.contains("store, tiers"), "{err}");
         assert!(sent.borrow().is_empty());
     }
@@ -2283,8 +2329,13 @@ mod tests {
         let mut p = provider(&dir);
         sync(&mut p, vec![new_row("milk")]);
         let (send, sent) = server(200, "{}");
-        let err = cloud::run_restore(&dir.path().join("notes"), Some("tok".to_owned()), &send)
-            .unwrap_err();
+        let err = sicompass_payments::cloud::run_restore(
+            &cloud::SERVICE,
+            &dir.path().join("notes"),
+            Some("tok".to_owned()),
+            &send,
+        )
+        .unwrap_err();
         assert_eq!(err, sicompass_payments::protocol::RESTORE_REFUSED);
         assert!(sent.borrow().is_empty());
     }

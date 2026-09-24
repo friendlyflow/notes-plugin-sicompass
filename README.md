@@ -57,9 +57,7 @@ a release is made.
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK and the WASM plugin kit
-- [payments_plugin_sicompass](https://github.com/friendlyflow/payments_plugin_sicompass),
-  the cloud backup library
+  the SDK, the WASM plugin kit and the cloud backup library
 
 ## Community
 
