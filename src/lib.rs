@@ -1,4 +1,9 @@
-//! The notes provider: a tree of the user's own writing, hashed for sync.
+//! The notes plugin: a tree of the user's own writing, hashed for sync.
+//!
+//! A sicompass WASM plugin. The notes live in the plugin's own folder
+//! (`"storage": true`, which the host maps to the same directory the built-in
+//! notes used, so nothing moves), and the optional cloud backup is in
+//! [`cloud`].
 //!
 //! # Two invariants, both easy to break by accident
 //!
@@ -16,81 +21,32 @@
 //!
 //! # Where writes come from
 //!
-//! Almost nowhere in this file. The provider declares
-//! `supports_structural_edit()`, so the app owns the mutation: it edits its own
+//! Almost nowhere in this file. The plugin declares
+//! `supports_structural_edit`, so the app owns the mutation: it edits its own
 //! FFON tree from the keypress, records the `Structural` entry that makes
 //! ctrl-Z work, and hands the result back through
-//! [`Provider::sync_ffon_body_children`]. That one method is the write path for
+//! [`Plugin::sync_ffon_body_children`]. That one method is the write path for
 //! inserts, deletes, cuts, pastes, renames, undo and redo alike — it diffs the
 //! list it is given against the tree by id, and saves.
 //!
-//! The consequence worth stating: this provider implements no `undo`/`redo`.
+//! The consequence worth stating: this plugin implements no `undo`/`redo`.
 //! There is nothing for it to reverse, because it never applied anything the
 //! app did not already record.
 
+pub mod cloud;
 mod escape;
+pub mod localize;
 pub mod store;
 pub mod tree;
 
-use sicompass_payments::cloud::CloudBackup;
+use cloud::{Cloud, CloudHost, Finished, PluginHost};
+use sicompass_pdk::{Descriptor, Plugin, PollResult, TaskEvent, export_plugin};
 use sicompass_sdk::ffon::FfonElement;
-use sicompass_sdk::{
-    BuiltinManifest, Provider, SettingDecl, localize, register_builtin_manifest,
-    register_provider_factory, tags,
-};
+use sicompass_sdk::tags;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use tree::{Node, NodeId, Tree, Visibility};
-
-// ---------------------------------------------------------------------------
-// Test stub: never touch the user's real notes from a test.
-//
-// The failure this prevents is not a flaky test, it is data loss. `save_tree`
-// reconciles a directory against a tree, so a test that builds a two-node tree
-// and saves it to the real notes directory does not add two notes — it deletes
-// everything else.
-//
-// Two audiences, hence a compile-time default and a runtime setter:
-//
-// * This crate's own unit tests get it free from `cfg!(test)`. Setting the
-//   per-instance `root_override` is the right way to make a test safe, but
-//   forgetting it must fail closed rather than silently reaching the real
-//   store.
-// * The app's integration tests are a different binary, where this crate is an
-//   ordinary dependency compiled *without* `cfg(test)`, and they reach the
-//   provider as a `Box<dyn Provider>` with no way to set the override. They
-//   call `_set_test_no_persist(true)` once per binary instead.
-// ---------------------------------------------------------------------------
-
-static TEST_NO_PERSIST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(cfg!(test));
-
-#[doc(hidden)]
-pub fn _set_test_no_persist(enabled: bool) {
-    TEST_NO_PERSIST.store(enabled, std::sync::atomic::Ordering::Release);
-}
-
-#[inline]
-fn test_no_persist() -> bool {
-    TEST_NO_PERSIST.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Register this crate's Fluent bundles. Idempotent.
-///
-/// Called from `register()` *and* from every trait method that resolves a
-/// string: a provider built through the factory can be reached before
-/// `register()` has run on some paths, and an unresolved key renders as the key.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Command ids
@@ -103,11 +59,6 @@ pub fn register_translations() {
 // which unwinds the cursor to depth 3 before deleting — email-shaped surgery that
 // would maul a deep note tree.
 // ---------------------------------------------------------------------------
-
-/// Server-side name of this store, and the `settings.json` key for its cloud
-/// backup switch.
-const CLOUD_PLUGIN: &str = "notes";
-const CLOUD_ENABLE_KEY: &str = "notesCloudBackup";
 
 pub const CMD_RESTORE_BACKUP: &str = "restore cloud backup";
 pub const CMD_MOVE_UP: &str = "move up";
@@ -171,8 +122,8 @@ pub struct NotesProvider {
     /// Label to [`Segment`], per level. `push_path` is handed the text the user
     /// saw, so the code that rendered the labels is what answers for them.
     labels: HashMap<Vec<Segment>, HashMap<String, Segment>>,
-    /// Per-instance store location. Wins over everything, including the test
-    /// kill switch, so a tempdir-backed test is unaffected by it.
+    /// Per-instance store location, for the tests. Inside the sandbox the
+    /// store is the plugin's own folder, `/storage`.
     root_override: Option<PathBuf>,
     /// What the user just typed into an insert placeholder, if anything.
     ///
@@ -191,19 +142,15 @@ pub struct NotesProvider {
     /// Spoken once, then cleared. Used for an outcome that is worth saying but
     /// is not an error, such as a finished restore.
     announcement: Option<String>,
-    /// Opt-in mirror of the store to the license server. Inert until the user
-    /// ticks "enable cloud backup" in settings; see `lib_payments::cloud`.
-    cloud: CloudBackup,
-}
-
-impl Default for NotesProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Opt-in mirror of the store to Sicompass Cloud. Inert until the user
+    /// ticks "enable cloud backup" in the notes settings; see [`cloud`].
+    cloud: Cloud,
+    /// The host calls the cloud needs, injectable so the tests run natively.
+    host: Box<dyn CloudHost>,
 }
 
 impl NotesProvider {
-    pub fn new() -> Self {
+    pub fn with_host(host: Box<dyn CloudHost>) -> Self {
         NotesProvider {
             tree: Tree::new(),
             segments: Vec::new(),
@@ -215,24 +162,47 @@ impl NotesProvider {
             loaded: false,
             error: None,
             announcement: None,
-            cloud: CloudBackup::new(CLOUD_PLUGIN, CLOUD_ENABLE_KEY),
+            cloud: Cloud::default(),
+            host,
         }
+    }
+
+    /// Point the store somewhere else (the tests use a temporary directory).
+    pub fn set_root(&mut self, path: PathBuf) {
+        self.root_override = Some(path);
+        self.loaded = false;
+        self.load_failed = false;
     }
 
     /// Where the notes live. `None` means nowhere usable, and the tree stays in
     /// memory for the session rather than being silently discarded.
     ///
-    /// Deliberately `data_home()` and not `state_home()`: on macOS the latter is
-    /// `~/Library/Logs`, which the OS and every cleanup tool treat as
-    /// disposable. Notes are documents.
+    /// In the sandbox that is `/storage`, which the host maps to the plugin's
+    /// own folder in the data directory (not the state directory: on macOS that
+    /// is `~/Library/Logs`, which cleanup tools treat as disposable, and notes
+    /// are documents). Natively, in the unit tests, nothing unless a test set
+    /// one: a test that forgot must fail closed, never reach real notes.
     fn root(&self) -> Option<PathBuf> {
         if let Some(p) = &self.root_override {
             return Some(p.clone());
         }
-        if test_no_persist() {
-            return None;
-        }
-        sicompass_sdk::platform::app_data_dir().map(|d| d.join("notes"))
+        cfg!(target_arch = "wasm32").then(|| PathBuf::from(sicompass_pdk::STORAGE_DIR))
+    }
+
+    pub fn at_root(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    pub fn take_announcement(&mut self) -> Option<String> {
+        self.announcement
+            .take()
+            .or_else(|| self.cloud.take_announcement())
+    }
+
+    pub fn take_error(&mut self) -> Option<String> {
+        // The plugin's own error leads: notes that could not be saved matter
+        // more than a backup that could not be uploaded.
+        self.error.take().or_else(|| self.cloud.take_error())
     }
 
     fn ensure_loaded(&mut self) {
@@ -264,9 +234,9 @@ impl NotesProvider {
             // The disk write failed, so there is no new state worth mirroring.
             return;
         }
-        // Queues only. This runs on the UI thread once per keystroke, so the
-        // upload itself belongs to the worker in `lib_payments::cloud`.
-        self.cloud.mark_dirty(&root);
+        // Queues only. This runs once per keystroke, so the upload itself is a
+        // background task, started from `poll` once the notes are quiet.
+        self.cloud.mark_dirty(&*self.host);
     }
 
     /// The node-id chain for the current level, ignoring a trailing `Meta`.
@@ -407,7 +377,7 @@ impl NotesProvider {
         // place, whether or not the subscription is paid for. The notes
         // themselves are listed below it either way.
         if path.is_empty()
-            && let Some(row) = self.cloud.row()
+            && let Some(row) = self.cloud.row(&*self.host)
         {
             out.push(row);
         }
@@ -497,12 +467,12 @@ impl NotesProvider {
             if rendered_only.contains(&raw) {
                 continue;
             }
-            // The cloud row is rendered, never stored. Matched by "carries a
-            // link" rather than by text, because its wording changes with the
-            // subscription and with the user's language. Safe here because
-            // `escape` puts every note's own angle brackets beyond reach, so
-            // no note can ever carry a real `<link>`.
-            if CloudBackup::is_row(&raw) {
+            // The cloud row is rendered, never stored. Matched by its `<id>`
+            // rather than by text, because its wording changes with the
+            // subscription and with the user's language. No note can claim
+            // that id: note ids are numbers, and `row_id` reads only the
+            // prefix this plugin wrote.
+            if Cloud::is_row(&raw) {
                 continue;
             }
             let text = row_text(&raw);
@@ -636,42 +606,58 @@ fn row_text(raw: &str) -> String {
     }
 }
 
-#[async_trait::async_trait]
-impl Provider for NotesProvider {
-    fn name(&self) -> &str {
-        "notes"
+impl Plugin for NotesProvider {
+    fn new() -> Self {
+        NotesProvider::with_host(Box::new(PluginHost))
     }
 
-    fn display_name(&self) -> String {
-        register_translations();
-        localize::t("notes-display-name")
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: "notes".to_owned(),
+            display_name: localize::t("notes-display-name"),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            supports_structural_edit: true,
+            supports_config_files: true,
+            ..Default::default()
+        }
     }
 
-    fn version(&self) -> Option<&str> {
-        Some(env!("CARGO_PKG_VERSION"))
+    /// Pick up the backup switch as the user left it, quietly: the "needs a
+    /// subscription" notice is for the moment they switch it on.
+    fn init(&mut self) {
+        let on = sicompass_pdk::host::get_setting(cloud::ENABLE_KEY);
+        self.cloud.restore_enabled(on.as_deref() == Some("true"));
     }
 
     fn fetch(&mut self) -> Vec<FfonElement> {
-        register_translations();
         self.ensure_loaded();
         self.level_children()
     }
 
-    fn supports_structural_edit(&self) -> bool {
-        true
+    /// Every frame: start a backup once the notes have been quiet long
+    /// enough, and hand over whatever needs saying.
+    fn poll(&mut self) -> PollResult {
+        self.cloud.tick(&*self.host);
+        let needs_refresh = self.cloud.needs_refresh();
+        self.cloud.clear_needs_refresh();
+        PollResult {
+            at_root: self.at_root(),
+            needs_refresh,
+            is_busy: self.cloud.is_busy(),
+            error: self.take_error(),
+            announcement: self.take_announcement(),
+            structural_edit_here: true,
+            dashboard_here: false,
+            ..Default::default()
+        }
     }
 
     /// Where every edit lands. See the module docs.
     fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
-        register_translations();
         self.ensure_loaded();
         // The meta level holds rendered controls, not notes; a radio toggle
         // there arrives through `on_radio_change` instead.
         if self.in_meta() {
-            return;
-        }
-        // Same reasoning, for a page that is not ours at all.
-        if sicompass_payments::cloud::is_grafted_page(children) {
             return;
         }
         self.reconcile(children);
@@ -682,7 +668,6 @@ impl Provider for NotesProvider {
     /// The rename itself is done by `sync_ffon_body_children`, which the app
     /// calls right after this with the whole list and its ids.
     fn commit_edit(&mut self, old: &str, _new: &str) -> bool {
-        register_translations();
         if self.load_failed {
             self.error = Some(localize::t("notes-error-unreadable"));
             return false;
@@ -714,7 +699,6 @@ impl Provider for NotesProvider {
     /// `name` is the raw element text, tags intact, so the meta row is
     /// recognisable by its key.
     fn delete_item(&mut self, name: &str) -> bool {
-        register_translations();
         if self.load_failed {
             self.error = Some(localize::t("notes-error-unreadable"));
             return false;
@@ -723,25 +707,24 @@ impl Provider for NotesProvider {
             self.error = Some(localize::t("notes-error-meta-undeletable"));
             return false;
         }
+        // The backup row is the switch's, in settings, not a note.
+        if Cloud::is_row(name) {
+            self.error = Some(localize::t("notes-error-cloud-row-undeletable"));
+            return false;
+        }
         // The removal itself is the app's; it reports the result back through
         // `sync_ffon_body_children`.
         true
     }
 
-    /// Two radios can reach this provider, and they must not be confused.
+    /// The visibility switch, which `meta_children` offers in exactly one
+    /// place: a note's own meta list, `[Node(note), Meta]`.
     ///
-    /// The visibility switch is ours, and `meta_children` offers it in exactly
-    /// one place: a note's own meta list, `[Node(note), Meta]`. Everything else
-    /// came from the server's cloud tier tree, which the app grafts into this
-    /// provider's own tree when the user follows the cloud row.
-    ///
-    /// Routing on position rather than on the value matters: the old code
-    /// treated every value that was not "private" as "public", so the cloud
-    /// tier's "per year" would have quietly published a note.
-    fn on_radio_change(&mut self, group: &str, value: &str) {
-        register_translations();
+    /// Routing on position rather than on the value matters: every value that
+    /// is not "private" counts as "public", so a radio from anywhere else must
+    /// never reach the note.
+    fn on_radio_change(&mut self, _group: &str, value: &str) {
         if !(self.segments.len() == 2 && self.in_meta()) {
-            self.cloud.on_radio_change(group, value);
             return;
         }
         let private = localize::t("notes-visibility-private");
@@ -844,20 +827,6 @@ impl Provider for NotesProvider {
         self.sync_rendered_path();
     }
 
-    fn at_root(&self) -> bool {
-        self.segments.is_empty()
-    }
-
-    /// Point the store somewhere else. The trait's own escape hatch for tests,
-    /// and the only way the app's integration tests — a separate binary, where
-    /// this crate is compiled without `cfg(test)` and reached as a
-    /// `Box<dyn Provider>` — can keep away from the real notes directory.
-    fn set_config_path(&mut self, path: PathBuf) {
-        self.root_override = Some(path);
-        self.loaded = false;
-        self.load_failed = false;
-    }
-
     /// The children of the level the cursor is on, so a commit refreshes just
     /// that list. Without this the app falls back to rebuilding the provider
     /// root, which misroutes a deep path and leaves the level empty.
@@ -865,7 +834,6 @@ impl Provider for NotesProvider {
         if self.segments.is_empty() {
             return None;
         }
-        register_translations();
         self.ensure_loaded();
         Some(self.level_children())
     }
@@ -880,7 +848,6 @@ impl Provider for NotesProvider {
     /// display text, and no note is titled `n3`, so without this the descent
     /// stopped at the first level and the tab reopened at the root.
     fn fetch_subtree_parent_key(&mut self) -> Option<String> {
-        register_translations();
         match *self.segments.last()? {
             Segment::Meta => Some(localize::t("notes-list-meta")),
             Segment::Node(id) => {
@@ -905,149 +872,162 @@ impl Provider for NotesProvider {
     }
 
     fn command_label(&self, cmd: &str) -> String {
-        register_translations();
         match cmd {
             CMD_MOVE_UP => localize::t("notes-cmd-move-up"),
             CMD_MOVE_DOWN => localize::t("notes-cmd-move-down"),
             CMD_DUPLICATE => localize::t("notes-cmd-duplicate"),
-            CMD_RESTORE_BACKUP => localize::t("payments-command-restore"),
+            CMD_RESTORE_BACKUP => localize::t("notes-cmd-restore-backup"),
             other => other.to_owned(),
         }
     }
 
-    /// Pull the cloud backup back over an empty store.
+    /// Pull the cloud backup back over empty notes.
     ///
-    /// Returns `None` with no error so the palette closes back to the mode it
-    /// was opened from, the same way the board's commands do. The outcome is
-    /// spoken and shown instead, because "nothing was restored" and "restored"
-    /// both need saying and only one of them is an error.
+    /// Returns nothing so the palette closes back to the mode it was opened
+    /// from. The restore is a background task, and its outcome is spoken when
+    /// it ends ([`Plugin::on_task_event`]), because "nothing was restored" and
+    /// "restored" both need saying and only one of them is an error. Notes that
+    /// exist are refused here already, before anything reaches the network.
     fn handle_command(
         &mut self,
         cmd: &str,
         _elem_key: &str,
         _elem_type: i32,
-        _error: &mut String,
-    ) -> Option<FfonElement> {
+    ) -> Result<Option<FfonElement>, String> {
         if cmd != CMD_RESTORE_BACKUP {
-            return None;
+            return Ok(None);
         }
-        register_translations();
-        let root = self.root()?;
-        match self.cloud.restore(&root) {
-            Ok((restored, message)) => {
-                if restored {
-                    // The tree in memory is now stale: re-read it from what
-                    // was just written.
-                    self.loaded = false;
-                    self.load_failed = false;
-                    self.ensure_loaded();
-                }
-                self.announcement = Some(message);
-            }
-            Err(e) => self.error = Some(e),
+        self.ensure_loaded();
+        if !self.tree.notes.is_empty() || self.load_failed {
+            self.error = Some(localize::t("notes-restore-refused"));
+            return Ok(None);
         }
-        None
+        self.cloud.start_restore(&*self.host);
+        Ok(None)
     }
 
-    /// Cloud backup settings. The app broadcasts every setting to every
-    /// provider, so this only claims the three that are ours.
+    /// The backup switch. The host passes on only this plugin's own settings.
     fn on_setting_change(&mut self, key: &str, value: &str) {
-        self.cloud.on_setting_change(key, value);
+        self.cloud.on_setting_change(key, value, &*self.host);
     }
 
-    /// The controls inside the cloud tier tree, which the app grafts into
-    /// *this* provider's tree when the user follows the cloud row.
-    fn on_button_press(&mut self, function_name: &str) {
-        self.cloud.on_button_press(function_name);
+    /// In a fresh worker instance: the upload or the restore. Everything it
+    /// needs is on disk or from the host, so `input` carries only the hash of
+    /// the last upload.
+    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+        let root = self.root().ok_or("the notes have no folder")?;
+        let token = self.host.token();
+        match name {
+            cloud::TASK_BACKUP => cloud::run_backup(&root, input, token, &cloud::net_send),
+            cloud::TASK_RESTORE => cloud::run_restore(&root, token, &cloud::net_send),
+            other => Err(format!("no task named `{other}`")),
+        }
     }
 
-    /// The backup worker runs on its own thread, so a finished upload (or a
-    /// failed one) has to ask for the row to be redrawn.
-    fn needs_refresh(&self) -> bool {
-        self.cloud.needs_refresh()
-    }
-
-    fn clear_needs_refresh(&mut self) {
-        self.cloud.clear_needs_refresh();
-    }
-
-    fn take_announcement(&mut self) -> Option<String> {
-        self.announcement
-            .take()
-            .or_else(|| self.cloud.take_announcement())
-    }
-
-    fn take_error(&mut self) -> Option<String> {
-        // The provider's own error leads: a store that could not be saved
-        // matters more than a backup that could not be uploaded.
-        self.error.take().or_else(|| self.cloud.take_error())
-    }
-
-    fn supports_config_files(&self) -> bool {
-        true
+    fn on_task_event(&mut self, id: u64, event: TaskEvent) {
+        let TaskEvent::Done(result) = event else {
+            return;
+        };
+        if self.cloud.on_task_done(id, result) == Finished::Restored {
+            // The tree in memory is stale: re-read what the task wrote.
+            self.loaded = false;
+            self.load_failed = false;
+            self.ensure_loaded();
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
-
-pub fn register() {
-    register_translations();
-    register_provider_factory("notes", || Box::new(NotesProvider::new()));
-    register_builtin_manifest(
-        BuiltinManifest::new("notes", "notes")
-            .enable_by_default()
-            .with_settings(vec![SettingDecl::checkbox(
-                "notes",
-                "notes-checkbox-cloud-backup",
-                CLOUD_ENABLE_KEY,
-                // Off by default. Notes are the most private thing in the app,
-                // so sending them anywhere is something the user asks for.
-                false,
-            )]),
-    );
-}
+export_plugin!(NotesProvider);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sicompass_payments::cert::LicenseStatus;
+    use sicompass_payments::protocol::{Request, Response};
+    use sicompass_payments::row::Standing;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
     use tempfile::TempDir;
+
+    /// The host as the tests set it: a clock, a standing, a token, and a log
+    /// of the tasks spawned. Cloned into the provider, so a test keeps a handle.
+    #[derive(Clone)]
+    struct FakeHost(Rc<FakeState>);
+
+    struct FakeState {
+        now: Cell<u64>,
+        standing: Cell<Standing>,
+        token: RefCell<Option<String>>,
+        spawned: RefCell<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl FakeHost {
+        fn new(standing: Standing) -> Self {
+            FakeHost(Rc::new(FakeState {
+                now: Cell::new(0),
+                standing: Cell::new(standing),
+                token: RefCell::new(Some("tok-42".to_owned())),
+                spawned: RefCell::new(Vec::new()),
+            }))
+        }
+
+        fn advance(&self, ms: u64) {
+            self.0.now.set(self.0.now.get() + ms);
+        }
+
+        fn spawned(&self) -> Vec<(String, Vec<u8>)> {
+            self.0.spawned.borrow().clone()
+        }
+    }
+
+    impl CloudHost for FakeHost {
+        fn now_millis(&self) -> u64 {
+            self.0.now.get()
+        }
+
+        fn standing(&self) -> Standing {
+            self.0.standing.get()
+        }
+
+        /// Task ids are 1, 2, 3, in spawn order.
+        fn spawn(&self, task: &str, input: &[u8]) -> Result<u64, String> {
+            let mut log = self.0.spawned.borrow_mut();
+            log.push((task.to_owned(), input.to_vec()));
+            Ok(log.len() as u64)
+        }
+
+        fn token(&self) -> Option<String> {
+            self.0.token.borrow().clone()
+        }
+    }
 
     /// A provider backed by a real, disposable directory.
     ///
-    /// Every test uses one. The `cfg!(test)` default already stops a forgotten
-    /// override reaching the user's notes, but a test that asserts anything
+    /// Every test uses one. Natively `root()` is nothing without it, so a
+    /// forgotten one cannot reach real notes, but a test that asserts anything
     /// about the store needs somewhere real to look.
     fn provider(dir: &TempDir) -> NotesProvider {
-        register_translations();
-        // This binary compiles `sicompass-payments` without `cfg(test)`, so
-        // its own `cfg!(test)` default is off here and the guard has to be set
-        // explicitly. Without it these tests would read the developer's real
-        // settings and could write a token into their live config.
-        sicompass_payments::config::_set_test_no_persist(true);
-        let mut p = NotesProvider::new();
-        p.root_override = Some(dir.path().join("notes"));
+        provider_on(dir, &FakeHost::new(Standing::Missing))
+    }
+
+    fn provider_on(dir: &TempDir, host: &FakeHost) -> NotesProvider {
+        let mut p = NotesProvider::with_host(Box::new(host.clone()));
+        p.set_root(dir.path().join("notes"));
         p
     }
 
-    /// A provider with cloud backup switched on and a known subscription.
-    ///
-    /// The status is forced rather than read off disk: `cloud_status()` looks
-    /// in the real user config directory, so without this a developer who
-    /// actually holds a subscription would see different rows than CI does.
-    fn provider_with_cloud(dir: &TempDir, status: LicenseStatus) -> NotesProvider {
-        sicompass_payments::cloud::_set_test_status(Some(status));
-        let mut p = provider(dir);
-        p.on_setting_change("storeUrl", "http://127.0.0.1:1");
-        p.on_setting_change(CLOUD_ENABLE_KEY, "true");
+    /// A provider with cloud backup switched on and a known standing.
+    fn provider_with_cloud(dir: &TempDir, standing: Standing) -> NotesProvider {
+        cloud_on(dir, &FakeHost::new(standing))
+    }
+
+    fn cloud_on(dir: &TempDir, host: &FakeHost) -> NotesProvider {
+        let mut p = provider_on(dir, host);
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
         p
     }
 
-    fn active_licence() -> LicenseStatus {
-        LicenseStatus::Active {
-            licensee: "Acme Corp".to_owned(),
+    fn active_licence() -> Standing {
+        Standing::Active {
             renews_in_days: 342,
         }
     }
@@ -1101,6 +1081,17 @@ mod tests {
         labels(elems)
             .into_iter()
             .filter(|l| *l != localize::t("notes-list-meta"))
+            .collect()
+    }
+
+    /// Every row verbatim, tags and all: what `delete_item` is handed.
+    fn labels_raw(elems: &[FfonElement]) -> Vec<String> {
+        elems
+            .iter()
+            .map(|e| match e {
+                FfonElement::Str(s) => s.clone(),
+                FfonElement::Obj(o) => o.key.clone(),
+            })
             .collect()
     }
 
@@ -1836,7 +1827,6 @@ mod tests {
         // No override and the test guard on: `root()` is None, and the tree
         // lives in memory for the session rather than being discarded.
         let mut p = NotesProvider::new();
-        register_translations();
         sync(&mut p, vec![new_row("in memory only")]);
         assert_eq!(p.tree.notes.len(), 1);
     }
@@ -1867,7 +1857,6 @@ mod tests {
     /// forgotten entry would show in Settings as `notes-checkbox-cloud-backup`.
     #[test]
     fn the_cloud_backup_checkbox_label_resolves() {
-        register_translations();
         let label = localize::t("notes-checkbox-cloud-backup");
         assert_ne!(label, "notes-checkbox-cloud-backup");
         assert!(label.contains("cloud"), "{label}");
@@ -1877,7 +1866,6 @@ mod tests {
     /// which would leave this provider's path a level deeper than the cursor.
     #[test]
     fn the_meta_rows_key_is_never_the_bare_word_meta() {
-        register_translations();
         assert_ne!(localize::t("notes-list-meta"), "meta");
     }
 
@@ -1902,18 +1890,18 @@ mod tests {
     #[test]
     fn the_cloud_row_leads_the_root_level_once_switched_on() {
         let dir = TempDir::new().unwrap();
-        let mut p = provider_with_cloud(&dir, LicenseStatus::None);
+        let mut p = provider_with_cloud(&dir, Standing::Missing);
         sync(&mut p, vec![new_row("milk")]);
 
         let rendered = rows(&mut p);
-        let FfonElement::Obj(first) = &rendered[0] else {
-            panic!("the cloud row must be an Obj so the app will follow it");
+        // A plain row: it says where the user stands and links nowhere, since
+        // buying and redeeming are in store, tiers.
+        let FfonElement::Str(first) = &rendered[0] else {
+            panic!("the cloud row is a plain row, not something to follow");
         };
-        assert!(
-            first.key.contains("<link>http://127.0.0.1:1/cloud</link>"),
-            "{}",
-            first.key
-        );
+        assert!(Cloud::is_row(first), "{first}");
+        assert!(!first.contains("<link>"), "{first}");
+        assert!(labels(&rendered)[0].contains("store, tiers"), "{first}");
 
         // And the user's notes are still there, below it. The paywall is on
         // the backup service, never on reading your own notes.
@@ -1925,7 +1913,7 @@ mod tests {
     fn the_cloud_row_wording_changes_once_it_is_paid_for() {
         let dir = TempDir::new().unwrap();
         let unpaid = {
-            let mut p = provider_with_cloud(&dir, LicenseStatus::None);
+            let mut p = provider_with_cloud(&dir, Standing::Missing);
             labels(&rows(&mut p))[0].clone()
         };
         let dir2 = TempDir::new().unwrap();
@@ -1958,12 +1946,12 @@ mod tests {
     #[test]
     fn the_cloud_row_is_never_stored_as_a_note() {
         let dir = TempDir::new().unwrap();
-        let mut p = provider_with_cloud(&dir, LicenseStatus::None);
+        let mut p = provider_with_cloud(&dir, Standing::Missing);
         sync(&mut p, vec![new_row("milk")]);
 
         // Exactly what the app hands back when the user changes nothing.
         let unchanged = rows(&mut p);
-        assert!(matches!(&unchanged[0], FfonElement::Obj(o) if CloudBackup::is_row(&o.key)));
+        assert!(matches!(&unchanged[0], FfonElement::Str(s) if Cloud::is_row(s)));
         sync(&mut p, unchanged);
 
         assert_eq!(
@@ -1984,7 +1972,7 @@ mod tests {
     #[test]
     fn a_second_note_does_not_absorb_the_cloud_row() {
         let dir = TempDir::new().unwrap();
-        let mut p = provider_with_cloud(&dir, LicenseStatus::None);
+        let mut p = provider_with_cloud(&dir, Standing::Missing);
         sync(&mut p, vec![new_row("milk")]);
 
         let mut again = rows(&mut p);
@@ -1999,37 +1987,10 @@ mod tests {
         );
     }
 
-    /// An edit made on the grafted payment page must not rewrite the notes.
+    /// Only the visibility switch in a note's own meta list may publish it. A
+    /// radio from anywhere else must never change who can see a note.
     #[test]
-    fn an_edit_on_the_payment_page_does_not_touch_the_notes() {
-        let dir = TempDir::new().unwrap();
-        let mut p = provider_with_cloud(&dir, active_licence());
-        sync(&mut p, vec![new_row("milk")]);
-        p.fetch();
-
-        // What the server's /cloud tree looks like once the app has grafted it
-        // into this provider and the user has typed into one of its inputs.
-        let tier_page = vec![
-            FfonElement::new_str("Enable 'cloud and store' per month"),
-            FfonElement::new_str("Lemonsqueezy setup: <input>acct-1</input>"),
-            FfonElement::new_obj("<radio>monthly or yearly"),
-            FfonElement::new_str("<button>checkout:cloud</button>for payment"),
-            FfonElement::new_str("License redeem token: <input>tok-42</input>"),
-        ];
-        sync(&mut p, tier_page);
-
-        let texts: Vec<String> = p.tree.notes.iter().map(|n| n.text.clone()).collect();
-        assert_eq!(
-            texts,
-            vec!["milk".to_owned()],
-            "the checkout form must never become the user's notes: {texts:?}"
-        );
-    }
-
-    /// The cloud tier tree is grafted into this provider, so its radio must
-    /// not be mistaken for the note visibility switch one level down.
-    #[test]
-    fn a_tier_radio_does_not_publish_a_note() {
+    fn a_radio_outside_the_note_meta_does_not_publish_a_note() {
         let dir = TempDir::new().unwrap();
         let mut p = provider_with_cloud(&dir, active_licence());
         sync(&mut p, vec![new_branch_row("Groceries")]);
@@ -2048,13 +2009,12 @@ mod tests {
     #[test]
     fn switching_on_without_a_subscription_is_announced() {
         let dir = TempDir::new().unwrap();
-        sicompass_payments::cloud::_set_test_status(Some(LicenseStatus::None));
         let mut p = provider(&dir);
-        p.on_setting_change(CLOUD_ENABLE_KEY, "true");
+        p.on_setting_change(cloud::ENABLE_KEY, "true");
         let spoken = p
             .take_announcement()
             .expect("the screen reader must say why");
-        assert!(spoken.contains("cloud and store"), "{spoken}");
+        assert!(spoken.contains("Sicompass Cloud"), "{spoken}");
     }
 
     /// The restore command is only worth offering once backup is on.
@@ -2073,15 +2033,259 @@ mod tests {
     #[test]
     fn restore_refuses_to_overwrite_existing_notes() {
         let dir = TempDir::new().unwrap();
-        let mut p = provider_with_cloud(&dir, active_licence());
-        p.on_setting_change("licenseRedeemToken", "tok-42");
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
         sync(&mut p, vec![new_row("milk")]);
 
-        let mut error = String::new();
-        p.handle_command(CMD_RESTORE_BACKUP, "", 0, &mut error);
+        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
 
         assert!(p.take_error().is_some(), "the refusal has to be reported");
+        assert!(
+            !host.spawned().iter().any(|(t, _)| t == cloud::TASK_RESTORE),
+            "refused before anything reaches the network"
+        );
         assert_eq!(p.tree.notes.len(), 1);
         assert_eq!(p.tree.notes[0].text, "milk");
+    }
+
+    /// Switched on at start-up from the saved setting, nothing is announced:
+    /// the notice is for the moment the user turns it on.
+    #[test]
+    fn the_saved_switch_is_picked_up_quietly() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider(&dir);
+        p.cloud.restore_enabled(true);
+        assert!(p.take_announcement().is_none());
+        assert!(Cloud::is_row(&labels_raw(&rows(&mut p))[0]));
+    }
+
+    /// The backup row is rendered by the plugin, not a note the user can
+    /// delete. The switch in settings is what removes it.
+    #[test]
+    fn the_cloud_row_cannot_be_deleted() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider_with_cloud(&dir, active_licence());
+        let row = labels_raw(&rows(&mut p))[0].clone();
+        assert!(!p.delete_item(&row));
+        assert!(p.take_error().is_some());
+    }
+
+    // ---- Uploads ---------------------------------------------------------
+
+    /// An upload waits until the notes have been quiet for the debounce, and
+    /// then runs as a background task, never on the UI.
+    #[test]
+    fn a_backup_starts_once_the_notes_are_quiet() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
+        sync(&mut p, vec![new_row("milk")]);
+
+        host.advance(1_000);
+        p.poll();
+        assert!(host.spawned().is_empty(), "still typing");
+
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS);
+        let busy = p.poll().is_busy;
+        assert_eq!(
+            host.spawned(),
+            vec![(cloud::TASK_BACKUP.to_owned(), Vec::new())]
+        );
+        assert!(busy, "closing the tab now would lose the upload");
+
+        // Once is enough: nothing changed since.
+        host.advance(60_000);
+        p.poll();
+        assert_eq!(host.spawned().len(), 1);
+    }
+
+    /// The hash the server acknowledged travels with the next upload, so an
+    /// unchanged store costs nothing.
+    #[test]
+    fn the_next_backup_carries_the_last_hash() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
+        sync(&mut p, vec![new_row("milk")]);
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.poll();
+        p.on_task_event(1, TaskEvent::Done(Ok(b"abc".to_vec())));
+        assert!(!p.poll().is_busy);
+
+        let again = rows(&mut p);
+        sync(&mut p, again);
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.poll();
+        assert_eq!(
+            host.spawned()[1],
+            (cloud::TASK_BACKUP.to_owned(), b"abc".to_vec())
+        );
+    }
+
+    /// The paywall is on the service: without a subscription the notes are
+    /// still saved, and only the upload does not happen.
+    #[test]
+    fn nothing_is_uploaded_without_a_subscription() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(Standing::Missing);
+        let mut p = cloud_on(&dir, &host);
+        sync(&mut p, vec![new_row("milk")]);
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.poll();
+        assert!(host.spawned().is_empty());
+        assert!(store::load_tree(&dir.path().join("notes")).is_some_and(|t| t.notes.len() == 1));
+    }
+
+    #[test]
+    fn grace_keeps_the_backup_running() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(Standing::Grace { days_left: 3 });
+        let mut p = cloud_on(&dir, &host);
+        assert!(labels(&rows(&mut p))[0].contains('3'));
+        sync(&mut p, vec![new_row("milk")]);
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.poll();
+        assert_eq!(host.spawned().len(), 1);
+    }
+
+    #[test]
+    fn nothing_is_uploaded_with_the_switch_off() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = provider_on(&dir, &host);
+        sync(&mut p, vec![new_row("milk")]);
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.poll();
+        assert!(host.spawned().is_empty());
+    }
+
+    #[test]
+    fn a_failed_backup_is_reported_with_its_reason() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
+        sync(&mut p, vec![new_row("milk")]);
+        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.poll();
+        p.on_task_event(
+            1,
+            TaskEvent::Done(Err("That license has expired".to_owned())),
+        );
+        let error = p.poll().error.expect("a failed upload is said");
+        assert!(error.contains("That license has expired"), "{error}");
+        assert_eq!(p.tree.notes.len(), 1, "and the notes are untouched");
+    }
+
+    // ---- Restore ---------------------------------------------------------
+
+    /// Over empty notes, the restore runs as a task; when it has written the
+    /// server's copy, the notes are read again and the outcome is spoken.
+    #[test]
+    fn a_finished_restore_reloads_the_notes() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
+        p.fetch();
+        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
+        assert_eq!(
+            host.spawned(),
+            vec![(cloud::TASK_RESTORE.to_owned(), Vec::new())]
+        );
+
+        // What the task wrote, from its own instance.
+        let mut elsewhere = provider(&dir);
+        sync(&mut elsewhere, vec![new_row("from the cloud")]);
+
+        p.on_task_event(1, TaskEvent::Done(Ok(b"restored".to_vec())));
+        let poll = p.poll();
+        assert!(poll.needs_refresh);
+        assert!(poll.announcement.is_some_and(|a| a.contains("restored")));
+        assert!(note_labels(&p.fetch()).contains(&"from the cloud".to_owned()));
+    }
+
+    #[test]
+    fn an_empty_backup_is_said_not_shown_as_an_error() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
+        p.take_announcement();
+        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
+        p.on_task_event(1, TaskEvent::Done(Ok(b"empty".to_vec())));
+        let poll = p.poll();
+        assert!(poll.error.is_none());
+        assert_eq!(poll.announcement, Some(localize::t("notes-restore-empty")));
+    }
+
+    // ---- The tasks themselves --------------------------------------------
+
+    type Sent = Rc<RefCell<Vec<Request>>>;
+
+    /// A server that answers every request with `status` and `body`, and logs
+    /// what it was sent.
+    fn server(status: u16, body: &str) -> (impl Fn(&Request) -> Result<Response, String>, Sent) {
+        let sent: Sent = Rc::default();
+        let log = sent.clone();
+        let body = body.as_bytes().to_vec();
+        let send = move |r: &Request| {
+            log.borrow_mut().push(r.clone());
+            Ok(Response {
+                status,
+                body: body.clone(),
+            })
+        };
+        (send, sent)
+    }
+
+    #[test]
+    fn the_backup_task_uploads_the_store_and_returns_its_hash() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider(&dir);
+        sync(&mut p, vec![new_row("milk")]);
+        let root = dir.path().join("notes");
+
+        let (send, sent) = server(200, r#"{"stored":true}"#);
+        let hash = cloud::run_backup(&root, b"", Some("tok-42".to_owned()), &send).unwrap();
+        assert!(!hash.is_empty());
+        {
+            let sent = sent.borrow();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].method, "PUT");
+            assert_eq!(sent[0].url, "https://store.sicompass.org/plugins/notes");
+            assert!(
+                sent[0]
+                    .headers
+                    .contains(&("Authorization".to_owned(), "Bearer tok-42".to_owned()))
+            );
+        }
+
+        // Unchanged since: no request at all.
+        let again = cloud::run_backup(&root, &hash, Some("tok-42".to_owned()), &send).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_backup_task_needs_a_redeemed_token() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider(&dir);
+        sync(&mut p, vec![new_row("milk")]);
+        let (send, sent) = server(200, "{}");
+        let err = cloud::run_backup(&dir.path().join("notes"), b"", None, &send).unwrap_err();
+        assert!(err.contains("store, tiers"), "{err}");
+        assert!(sent.borrow().is_empty());
+    }
+
+    /// The last line of defence: even if the UI let it through, the task
+    /// itself never restores over notes that exist.
+    #[test]
+    fn the_restore_task_refuses_a_store_with_notes() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider(&dir);
+        sync(&mut p, vec![new_row("milk")]);
+        let (send, sent) = server(200, "{}");
+        let err = cloud::run_restore(&dir.path().join("notes"), Some("tok".to_owned()), &send)
+            .unwrap_err();
+        assert_eq!(err, sicompass_payments::protocol::RESTORE_REFUSED);
+        assert!(sent.borrow().is_empty());
     }
 }

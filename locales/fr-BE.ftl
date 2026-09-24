@@ -25,3 +25,19 @@ notes-error-meta-undeletable = l'info de liste appartient à la liste et ne peut
 notes-error-meta-readonly = l'info de liste ne peut pas être modifiée, changez la visibilité à l'intérieur
 notes-error-unreadable = vos notes n'ont pas pu être lues, rien n'a été enregistré, les fichiers sur le disque sont intacts
 notes-error-save = vos notes n'ont pas pu être enregistrées
+
+notes-description = Vos propres notes, un arbre de listes dans lesquelles vous écrivez, avec une sauvegarde cloud en option.
+notes-service = garde une copie de vos notes sur le serveur de Sicompass Cloud
+
+notes-cloud-needs-payment = sauvegarde cloud : demande Sicompass Cloud, voir store, abonnements
+notes-cloud-active = sauvegarde cloud : active, renouvellement dans { $days } jours
+notes-cloud-grace = sauvegarde cloud : abonnement expiré, encore active { $days } jours, renouvelez dans store, abonnements
+notes-cloud-expired = sauvegarde cloud : arrêtée, l'abonnement a expiré il y a { $days } jours, voir store, abonnements
+notes-cloud-needs-subscription = la sauvegarde cloud demande Sicompass Cloud, voir store, abonnements
+notes-cloud-failed = échec de la sauvegarde cloud : { $reason }
+notes-error-cloud-row-undeletable = la ligne de la sauvegarde cloud n'est pas une note, désactivez la sauvegarde cloud dans les paramètres pour la retirer
+
+notes-cmd-restore-backup = restaurer la sauvegarde cloud
+notes-restore-done = sauvegarde cloud restaurée
+notes-restore-empty = il n'y a aucune sauvegarde cloud à restaurer
+notes-restore-refused = vos notes ne sont pas vides, rien n'a été restauré

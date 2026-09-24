@@ -37,3 +37,22 @@ notes-error-meta-undeletable = the list meta row belongs to the list and cannot 
 notes-error-meta-readonly = the list meta row cannot be edited, change visibility from inside it
 notes-error-unreadable = your notes could not be read, so nothing has been saved, the files on disk are untouched
 notes-error-save = your notes could not be saved
+
+# The Store's description of this plugin, and of the paid service it offers.
+notes-description = Your own notes, a tree of lists you write in, with an optional cloud backup.
+notes-service = keeps a copy of your notes on the Sicompass Cloud server
+
+# The row at the top of the notes while cloud backup is on. It never links
+# anywhere: buying and redeeming are in store, tiers.
+notes-cloud-needs-payment = cloud backup: needs Sicompass Cloud, see store, tiers
+notes-cloud-active = cloud backup: on, renews in { $days } days
+notes-cloud-grace = cloud backup: subscription expired, still on for { $days } days, renew in store, tiers
+notes-cloud-expired = cloud backup: off, the subscription expired { $days } days ago, see store, tiers
+notes-cloud-needs-subscription = cloud backup needs Sicompass Cloud, see store, tiers
+notes-cloud-failed = cloud backup failed: { $reason }
+notes-error-cloud-row-undeletable = the cloud backup row is not a note, turn cloud backup off in settings to remove it
+
+notes-cmd-restore-backup = restore cloud backup
+notes-restore-done = cloud backup restored
+notes-restore-empty = there is no cloud backup to restore
+notes-restore-refused = your notes are not empty, so nothing was restored
