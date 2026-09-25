@@ -1,4 +1,4 @@
-# notes_plugin_sicompass
+# notes-plugin-sicompass
 
 *Your own notes, in Sicompass.*
 
