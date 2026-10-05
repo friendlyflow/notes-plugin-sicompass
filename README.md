@@ -15,8 +15,8 @@ everything below it, so a glance at the top of your notes tells you whether
 anything anywhere has changed. Inside a note's own list meta you can set it to
 private or public. New notes are private.
 
-Your notes are plain files in your Sicompass data folder, and nothing else can
-read them.
+Your notes are plain files in your Sicompass data folder, on your own
+computer.
 
 ## Cloud backup
 
@@ -43,21 +43,26 @@ it up to date.
 ## Building from source
 
 ```bash
-nix develop          # the toolchain, with the wasm32-wasip2 target
-cargo test           # the notes and the backup logic, natively
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/notes_plugin.wasm plugin.wasm
+nix develop          # the toolchain
+cargo test           # the notes and the backup logic
+cargo build --release
+cp target/release/notes-plugin plugin
 ```
 
-`./scripts/release-plugin.sh --dry-run` does the build, checks the component
-against `plugin.json`, and signs and verifies it with a throwaway key, the way
-a release is made.
+To install a build of your own, copy `plugin.json`, the built `plugin` program
+(`plugin.exe` on Windows) and `locales/` into a folder named `notes` in the
+Sicompass plugins folder (`~/.config/sicompass/plugins/` on Linux,
+`~/Library/Application Support/sicompass/plugins/` on macOS) and restart
+Sicompass.
+
+`./scripts/release-plugin.sh --dry-run` builds this computer's release, packs
+it, and signs and verifies it with a throwaway key, the way a release is made.
 
 ## Related repositories
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK, the WASM plugin kit and the cloud backup library
+  the SDK, the plugin kit and the cloud backup library
 
 ## Community
 

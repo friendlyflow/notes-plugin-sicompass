@@ -1,9 +1,9 @@
 //! The notes plugin: a tree of the user's own writing, hashed for sync.
 //!
-//! A sicompass WASM plugin. The notes live in the plugin's own folder
-//! (`"storage": true`, which the host maps to the same directory the built-in
-//! notes used, so nothing moves), and the optional cloud backup is in
-//! [`cloud`].
+//! A sicompass plugin: a program sicompass starts (`src/main.rs`), with the
+//! user's rights. The notes live in the plugin's own folder (`"storage":
+//! true`, the same directory the built-in notes used, so nothing moves), and
+//! the optional cloud backup is in [`cloud`].
 //!
 //! # Two invariants, both easy to break by accident
 //!
@@ -40,8 +40,8 @@ pub mod store;
 pub mod tree;
 
 use cloud::{Cloud, CloudHost, Finished, PluginHost};
-use sicompass_pdk::{Descriptor, Plugin, PollResult, TaskEvent, export_plugin};
 use sicompass_sdk::ffon::FfonElement;
+use sicompass_sdk::plugin::{Descriptor, Plugin, PollResult};
 use sicompass_sdk::tags;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -122,8 +122,8 @@ pub struct NotesProvider {
     /// Label to [`Segment`], per level. `push_path` is handed the text the user
     /// saw, so the code that rendered the labels is what answers for them.
     labels: HashMap<Vec<Segment>, HashMap<String, Segment>>,
-    /// Per-instance store location, for the tests. Inside the sandbox the
-    /// store is the plugin's own folder, `/storage`.
+    /// Per-instance store location, for the tests. In sicompass the store is
+    /// the plugin's own folder, [`sicompass_sdk::plugin::storage_dir`].
     root_override: Option<PathBuf>,
     /// What the user just typed into an insert placeholder, if anything.
     ///
@@ -177,16 +177,16 @@ impl NotesProvider {
     /// Where the notes live. `None` means nowhere usable, and the tree stays in
     /// memory for the session rather than being silently discarded.
     ///
-    /// In the sandbox that is `/storage`, which the host maps to the plugin's
-    /// own folder in the data directory (not the state directory: on macOS that
-    /// is `~/Library/Logs`, which cleanup tools treat as disposable, and notes
-    /// are documents). Natively, in the unit tests, nothing unless a test set
-    /// one: a test that forgot must fail closed, never reach real notes.
+    /// In sicompass that is the plugin's own folder, which the app creates in
+    /// the data directory (not the state directory: on macOS that is
+    /// `~/Library/Logs`, which cleanup tools treat as disposable, and notes are
+    /// documents). Outside sicompass, in the unit tests, nothing unless a test
+    /// set one: a test that forgot must fail closed, never reach real notes.
     fn root(&self) -> Option<PathBuf> {
         if let Some(p) = &self.root_override {
             return Some(p.clone());
         }
-        cfg!(target_arch = "wasm32").then(|| PathBuf::from(sicompass_pdk::STORAGE_DIR))
+        sicompass_sdk::plugin::storage_dir()
     }
 
     pub fn at_root(&self) -> bool {
@@ -608,7 +608,7 @@ fn row_text(raw: &str) -> String {
 
 impl Plugin for NotesProvider {
     fn new() -> Self {
-        NotesProvider::with_host(Box::new(PluginHost))
+        NotesProvider::with_host(Box::new(PluginHost::new()))
     }
 
     fn describe(&self) -> Descriptor {
@@ -625,7 +625,7 @@ impl Plugin for NotesProvider {
     /// Pick up the backup switch as the user left it, quietly: the "needs a
     /// subscription" notice is for the moment they switch it on.
     fn init(&mut self) {
-        let on = sicompass_pdk::host::get_setting(cloud::ENABLE_KEY);
+        let on = sicompass_sdk::plugin::host::get_setting(cloud::ENABLE_KEY);
         self.cloud.restore_enabled(on.as_deref() == Some("true"));
     }
 
@@ -637,6 +637,9 @@ impl Plugin for NotesProvider {
     /// Every frame: start a backup once the notes have been quiet long
     /// enough, and hand over whatever needs saying.
     fn poll(&mut self) -> PollResult {
+        for (id, result) in self.host.finished() {
+            self.task_done(id, result);
+        }
         self.cloud.tick(&*self.host);
         let needs_refresh = self.cloud.needs_refresh();
         self.cloud.clear_needs_refresh();
@@ -885,7 +888,7 @@ impl Plugin for NotesProvider {
     ///
     /// Returns nothing so the palette closes back to the mode it was opened
     /// from. The restore is a background task, and its outcome is spoken when
-    /// it ends ([`Plugin::on_task_event`]), because "nothing was restored" and
+    /// it ends ([`NotesProvider::task_done`]), because "nothing was restored" and
     /// "restored" both need saying and only one of them is an error. Notes that
     /// exist are refused here already, before anything reaches the network.
     fn handle_command(
@@ -910,33 +913,12 @@ impl Plugin for NotesProvider {
     fn on_setting_change(&mut self, key: &str, value: &str) {
         self.cloud.on_setting_change(key, value, &*self.host);
     }
+}
 
-    /// In a fresh worker instance: the upload or the restore. Everything it
-    /// needs is on disk or from the host, so `input` carries only the hash of
-    /// the last upload.
-    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
-        let root = self.root().ok_or("the notes have no folder")?;
-        let token = self.host.token();
-        let service = &cloud::SERVICE;
-        match name {
-            cloud::TASK_BACKUP => sicompass_payments::cloud::run_backup(
-                service,
-                &root,
-                input,
-                token,
-                &cloud::net_send,
-            ),
-            cloud::TASK_RESTORE => {
-                sicompass_payments::cloud::run_restore(service, &root, token, &cloud::net_send)
-            }
-            other => Err(format!("no task named `{other}`")),
-        }
-    }
-
-    fn on_task_event(&mut self, id: u64, event: TaskEvent) {
-        let TaskEvent::Done(result) = event else {
-            return;
-        };
+impl NotesProvider {
+    /// A background task ([`cloud::PluginHost`] runs them on threads) ended.
+    /// `poll` hands each one over, in the order they finished.
+    pub fn task_done(&mut self, id: u64, result: Result<Vec<u8>, String>) {
         if self.cloud.on_task_done(id, result, &*self.host) == Finished::Restored {
             // The tree in memory is stale: re-read what the task wrote.
             self.loaded = false;
@@ -945,8 +927,6 @@ impl Plugin for NotesProvider {
         }
     }
 }
-
-export_plugin!(NotesProvider);
 
 #[cfg(test)]
 mod tests {
@@ -2134,7 +2114,7 @@ mod tests {
         sync(&mut p, vec![new_row("milk")]);
         host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
         p.poll();
-        p.on_task_event(1, TaskEvent::Done(Ok(b"abc".to_vec())));
+        p.task_done(1, Ok(b"abc".to_vec()));
         assert!(!p.poll().is_busy);
 
         let again = rows(&mut p);
@@ -2192,10 +2172,7 @@ mod tests {
         sync(&mut p, vec![new_row("milk")]);
         host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
         p.poll();
-        p.on_task_event(
-            1,
-            TaskEvent::Done(Err("That license has expired".to_owned())),
-        );
+        p.task_done(1, Err("That license has expired".to_owned()));
         let error = p.poll().error.expect("a failed upload is said");
         assert!(error.contains("That license has expired"), "{error}");
         assert_eq!(p.tree.notes.len(), 1, "and the notes are untouched");
@@ -2217,11 +2194,11 @@ mod tests {
             vec![(cloud::TASK_RESTORE.to_owned(), Vec::new())]
         );
 
-        // What the task wrote, from its own instance.
+        // What the task wrote, from its own thread.
         let mut elsewhere = provider(&dir);
         sync(&mut elsewhere, vec![new_row("from the cloud")]);
 
-        p.on_task_event(1, TaskEvent::Done(Ok(b"restored".to_vec())));
+        p.task_done(1, Ok(b"restored".to_vec()));
         let poll = p.poll();
         assert!(poll.needs_refresh);
         assert!(poll.announcement.is_some_and(|a| a.contains("restored")));
@@ -2235,7 +2212,7 @@ mod tests {
         let mut p = cloud_on(&dir, &host);
         p.take_announcement();
         p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
-        p.on_task_event(1, TaskEvent::Done(Ok(b"empty".to_vec())));
+        p.task_done(1, Ok(b"empty".to_vec()));
         let poll = p.poll();
         assert!(poll.error.is_none());
         assert_eq!(poll.announcement, Some(localize::t("notes-restore-empty")));
