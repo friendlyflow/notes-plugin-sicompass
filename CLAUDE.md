@@ -43,8 +43,8 @@ GitHub releases, one build per platform. The plugin platform is described in
   and `reconcile` skips it. The app hands back whatever it displayed, so
   without that the row becomes a note. It never links anywhere: buying and
   redeeming are in the Store, under tiers.
-- **Nothing slow runs on the calls from the app.** Every call has a 10-second
-  deadline. `save` only marks the debounce. `poll` starts a `backup` task once
+- **Nothing slow runs on the calls from the app.** The app waits for
+  every call to answer. `save` only marks the debounce. `poll` starts a `backup` task once
   the notes are quiet, and `restore` is a task too. A task runs on a thread of
   its own (`PluginHost::spawn`), with only the notes folder on disk, the token
   and its `input`. `poll` hands its result to `NotesProvider::task_done`.
