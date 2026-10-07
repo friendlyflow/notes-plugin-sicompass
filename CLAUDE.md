@@ -20,7 +20,7 @@ GitHub releases, one build per platform. The plugin platform is described in
   are shown to the user before install: `storage` (the notes, in
   `sicompass_sdk::plugin::storage_dir()`, which is `<data dir>/notes`, the
   folder the old built-in used, so existing notes open unchanged) and
-  `allowedHosts ["store.sicompass.org"]` (the backup server). `service.tier` is
+  `allowedHosts ["store.sicompass.org"]` (the sync server). `service.tier` is
   `friendlyflow/cloud`, which is what lets `license::token` hand this plugin
   the user's Sicompass Cloud redeem token.
 - `locales/<lang>.ftl`, every id prefixed `notes-`, in all four languages.
@@ -29,27 +29,33 @@ GitHub releases, one build per platform. The plugin platform is described in
 - `src/lib.rs` is the provider (`NotesProvider`, `impl Plugin`), and
   `src/main.rs` makes it the program. `tree.rs` is the hashed tree, `store.rs` the on-disk format, `escape.rs` the escaping every
   row goes through.
-- `src/cloud.rs` is the optional cloud backup, off until the user ticks
-  "enable cloud backup". It uses the `sicompass-payments` library, with a
+- `src/cloud.rs` is the optional cloud sync, off until the user ticks
+  "enable cloud sync" (the settings key is still `notesCloudBackup`, so the
+  switch survived the change). It uses the `sicompass-sync` library, with a
   host of its own (`PluginHost`): the app through the plugin kit, threads for
   the tasks, and `ureq` (rustls) for the HTTP.
 
-## Cloud backup: three things that are easy to get wrong
+## Cloud sync: four things that are easy to get wrong
 
+- **The hash is a wire format, and not this repo's.** `tree.rs` applies
+  `sicompass_sync::merkle`'s formula, which the board plugin, the server and
+  every other computer share. The saved store must stay byte for byte its
+  canonical form (`merkle::to_files`), which a test checks: otherwise every
+  sync uploads a rewrite of it.
 - **The paywall is on the service, never on the data.** Whatever
   `license::standing` says, the notes are listed and saved to disk. Only the
-  upload is gated (active or grace).
-- **The backup row is rendered, never stored.** It carries `<id>cloud</id>`,
+  sync is gated (active or grace).
+- **The sync row is rendered, never stored.** It carries `<id>cloud</id>`,
   and `reconcile` skips it. The app hands back whatever it displayed, so
   without that the row becomes a note. It never links anywhere: buying and
   redeeming are in the Store, under tiers.
-- **Nothing slow runs on the calls from the app.** The app waits for
-  every call to answer. `save` only marks the debounce. `poll` starts a `backup` task once
-  the notes are quiet, and `restore` is a task too. A task runs on a thread of
-  its own (`PluginHost::spawn`), with only the notes folder on disk, the token
-  and its `input`. `poll` hands its result to `NotesProvider::task_done`.
-  Restore never runs over notes that exist, checked both in the UI and in the
-  task.
+- **Nothing slow runs on the calls from the app.** The app waits for every
+  call to answer. `save` only marks the debounce. `poll` starts a `sync` task
+  at start-up, once the notes are quiet, and every minute. A task runs on a
+  thread of its own (`PluginHost::spawn`), with only the notes folder on disk
+  and the token. `poll` hands its result to `NotesProvider::task_done`, where
+  what another computer changed is written and the tree read again, unless
+  the notes were saved meanwhile (then the next sync merges again).
 
 ## Environment (Nix)
 
@@ -108,7 +114,7 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/notes.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK comes from crates.io, and `sicompass-payments` by git at the SDK's
+The SDK comes from crates.io, and `sicompass-sync` by git at the SDK's
 release tag (the source is all in `../sicompass-plugin-sdk`). The
 commented-out `[patch]` in `Cargo.toml` is for working on them together, and
 stays commented on main.

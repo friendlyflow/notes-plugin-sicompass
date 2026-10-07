@@ -18,21 +18,26 @@ private or public. New notes are private.
 Your notes are plain files in your Sicompass data folder, on your own
 computer.
 
-## Cloud backup
+## Cloud sync
 
-Cloud backup is off until you turn it on, in Settings, under notes. With it on,
-a row at the top of your notes says where your subscription stands, and a copy
-of your notes goes to the Sicompass Cloud server a few seconds after you stop
-typing.
+Cloud sync is off until you turn it on, in Settings, under notes. With it on,
+a row at the top of your notes says where your subscription stands, and your
+notes stay the same on every computer you turn it on for. A few seconds after
+you stop typing, and once a minute otherwise, Sicompass sends your changes to
+the Sicompass Cloud server and brings in the changes you made elsewhere.
 
-Cloud backup is part of Sicompass Cloud, which you buy and redeem in the Store,
+Every note has a hash, shown in its list meta, that changes whenever anything
+in it changes. That is how Sicompass and the server know which notes are out
+of date, and the list meta also says whether a list changed since the last
+sync. When the same line was changed on two computers, the latest change is
+kept. A note deleted on one computer and edited on another is kept.
+
+Cloud sync is part of Sicompass Cloud, which you buy and redeem in the Store,
 under tiers. Without it your notes work exactly the same, and are only not
-copied to the server. After a subscription ends, backup keeps running for 14
-more days.
+synced. After a subscription ends, sync keeps running for 14 more days.
 
-To get your notes back on a new computer, turn cloud backup on and run restore
-cloud backup from the command palette. It only restores into empty notes, and
-never over notes you already have.
+On a new computer, turn cloud sync on, and your notes arrive. Sync with the
+cloud now, in the command palette, does it at once.
 
 ## Install
 
@@ -44,7 +49,7 @@ it up to date.
 
 ```bash
 nix develop          # the toolchain
-cargo test           # the notes and the backup logic
+cargo test           # the notes and the sync logic
 cargo build --release
 cp target/release/notes-plugin plugin
 ```
@@ -62,7 +67,7 @@ it, and signs and verifies it with a throwaway key, the way a release is made.
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK, the plugin kit and the cloud backup library
+  the SDK, the plugin kit and the cloud sync library (`sicompass-sync`)
 
 ## Community
 

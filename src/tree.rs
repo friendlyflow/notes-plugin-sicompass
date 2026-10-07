@@ -6,7 +6,8 @@
 //! hash instead of diffing documents. That only works if both sides compute the
 //! same bytes, so the definition below is a contract, not an implementation
 //! detail. Changing it invalidates every stored `.listmeta` and every
-//! comparison a peer has already made.
+//! comparison a peer has already made. It is `sicompass_sync::merkle`'s, which
+//! the board plugin and the sync server share; this module only applies it.
 //!
 //! ```text
 //! hash(leaf)   = sha256( b"s\0" || text )
@@ -29,7 +30,7 @@
 //!   of content. Hashing it would make a peer see a flipped switch as a rewrite
 //!   and re-send the whole note.
 
-use sha2::{Digest, Sha256};
+use sicompass_sync::merkle;
 
 /// A node's local identity. Minted once, never reused, never hashed.
 ///
@@ -103,19 +104,10 @@ impl Node {
 
     pub fn hash(&self) -> [u8; 32] {
         if self.is_branch {
-            let mut h = Sha256::new();
-            h.update(b"o\0");
-            h.update(self.text.as_bytes());
-            h.update(b"\0");
-            for c in &self.children {
-                h.update(c.hash());
-            }
-            h.finalize().into()
+            let children: Vec<[u8; 32]> = self.children.iter().map(Node::hash).collect();
+            merkle::branch_hash(&self.text, &children)
         } else {
-            let mut h = Sha256::new();
-            h.update(b"s\0");
-            h.update(self.text.as_bytes());
-            h.finalize().into()
+            merkle::leaf_hash(&self.text)
         }
     }
 
@@ -196,6 +188,19 @@ impl Tree {
         self.next_id = Node::max_id(&self.notes) + 1;
     }
 
+    /// The next id [`Tree::mint_id`] would hand out.
+    pub fn next_id(&self) -> NodeId {
+        self.next_id
+    }
+
+    /// Never hand out an id below `floor`. A reload (after a sync merged
+    /// another machine's notes in) rebuilds the counter from what is on disk,
+    /// which can be lower than ids the undo timeline still holds for deleted
+    /// notes; reusing one would let an undo bring a note back over another.
+    pub fn raise_counter(&mut self, floor: NodeId) {
+        self.next_id = self.next_id.max(floor);
+    }
+
     pub fn mint_id(&mut self) -> NodeId {
         let id = self.next_id.max(1);
         self.next_id = id + 1;
@@ -204,12 +209,8 @@ impl Tree {
 
     /// The root hash: the tree's identity, and what a peer compares first.
     pub fn root_hash(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(b"r\0");
-        for n in &self.notes {
-            h.update(n.hash());
-        }
-        h.finalize().into()
+        let notes: Vec<[u8; 32]> = self.notes.iter().map(Node::hash).collect();
+        merkle::root_hash(&notes)
     }
 
     pub fn root_hash_hex(&self) -> String {
@@ -237,13 +238,46 @@ impl Tree {
     }
 }
 
-/// Lowercase hex. Hand-rolled because `hex` is not a workspace dependency and
-/// the SDK boundary puts `lib_updater`'s copy out of reach.
-pub fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
+pub use merkle::hex;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hash is a wire format, so it is pinned to bytes computed
+    /// independently (Python's hashlib over the formula in the module doc).
+    /// The same vector is asserted in `sicompass-sync`'s `merkle` tests.
+    #[test]
+    fn the_root_hash_matches_the_published_vector() {
+        let mut groceries = Node::branch(1, "Groceries");
+        let mut weekend = Node::branch(3, "Weekend");
+        weekend.children.push(Node::leaf(4, "bread"));
+        groceries.children.push(Node::leaf(2, "milk"));
+        groceries.children.push(weekend);
+        let tree = Tree {
+            notes: vec![groceries, Node::leaf(5, "Ideas")],
+            next_id: 6,
+        };
+        assert_eq!(
+            tree.notes[0].hash_hex(),
+            "7f659c2de7c765c2d0ef2d8f16aa1ae315c7f071e74bcfa6419fdcbb1a99a25d"
+        );
+        assert_eq!(
+            tree.root_hash_hex(),
+            "02b439fedb3ec6dd9b403bfa49e40bf5eb3fdcacd8bf3f501eca3278d98f79ea"
+        );
+        assert_eq!(
+            Tree::new().root_hash_hex(),
+            "96229c0a1dcb79d7d50913f882e3144961b5616140ded9ab844bd685e08e3a30"
+        );
     }
-    s
+
+    #[test]
+    fn the_counter_can_be_raised_but_never_lowered() {
+        let mut t = Tree::new();
+        t.raise_counter(40);
+        assert_eq!(t.mint_id(), 40);
+        t.raise_counter(3);
+        assert_eq!(t.mint_id(), 41);
+    }
 }

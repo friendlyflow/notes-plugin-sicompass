@@ -3,7 +3,7 @@
 //! A sicompass plugin: a program sicompass starts (`src/main.rs`), with the
 //! user's rights. The notes live in the plugin's own folder (`"storage":
 //! true`, the same directory the built-in notes used, so nothing moves), and
-//! the optional cloud backup is in [`cloud`].
+//! the optional cloud sync is in [`cloud`].
 //!
 //! # Two invariants, both easy to break by accident
 //!
@@ -60,7 +60,7 @@ use tree::{Node, NodeId, Tree, Visibility};
 // would maul a deep note tree.
 // ---------------------------------------------------------------------------
 
-pub const CMD_RESTORE_BACKUP: &str = "restore cloud backup";
+pub const CMD_SYNC_NOW: &str = "sync with the cloud now";
 pub const CMD_MOVE_UP: &str = "move up";
 pub const CMD_MOVE_DOWN: &str = "move down";
 pub const CMD_DUPLICATE: &str = "duplicate";
@@ -140,10 +140,10 @@ pub struct NotesProvider {
     loaded: bool,
     error: Option<String>,
     /// Spoken once, then cleared. Used for an outcome that is worth saying but
-    /// is not an error, such as a finished restore.
+    /// is not an error, such as changes another computer synced in.
     announcement: Option<String>,
-    /// Opt-in mirror of the store to Sicompass Cloud. Inert until the user
-    /// ticks "enable cloud backup" in the notes settings; see [`cloud`].
+    /// Opt-in sync of the store through Sicompass Cloud. Inert until the user
+    /// ticks "enable cloud sync" in the notes settings; see [`cloud`].
     cloud: Cloud,
     /// The host calls the cloud needs, injectable so the tests run natively.
     host: Box<dyn CloudHost>,
@@ -201,7 +201,7 @@ impl NotesProvider {
 
     pub fn take_error(&mut self) -> Option<String> {
         // The plugin's own error leads: notes that could not be saved matter
-        // more than a backup that could not be uploaded.
+        // more than a sync that could not run.
         self.error.take().or_else(|| self.cloud.take_error())
     }
 
@@ -220,6 +220,7 @@ impl NotesProvider {
                 self.error = Some(localize::t("notes-error-unreadable"));
             }
         }
+        self.cloud.load_base(&root);
     }
 
     fn save(&mut self) {
@@ -231,10 +232,10 @@ impl NotesProvider {
         };
         if let Err(e) = store::save_tree(&root, &self.tree) {
             self.error = Some(format!("{}: {e}", localize::t("notes-error-save")));
-            // The disk write failed, so there is no new state worth mirroring.
+            // The disk write failed, so there is no new state worth syncing.
             return;
         }
-        // Queues only. This runs once per keystroke, so the upload itself is a
+        // Queues only. This runs once per keystroke, so the sync itself is a
         // background task, started from `poll` once the notes are quiet.
         self.cloud.mark_dirty(&*self.host);
     }
@@ -339,12 +340,20 @@ impl NotesProvider {
         let hash = self
             .current_list_owner_hash()
             .unwrap_or_else(|| self.tree.root_hash_hex());
+        // While cloud sync is on: whether this list is as it was at the last
+        // sync, from the same Merkle hash the line above shows.
+        let status = self
+            .cloud
+            .sync_status(self.node_path().last().copied(), &hash, &*self.host);
         let mut args = localize::Args::new();
         args.set("hash", hash);
         out.push(FfonElement::new_str(localize::t_args(
             "notes-sha256",
             &args,
         )));
+        if let Some(line) = status {
+            out.push(FfonElement::new_str(line));
+        }
         out
     }
 
@@ -634,8 +643,8 @@ impl Plugin for NotesProvider {
         self.level_children()
     }
 
-    /// Every frame: start a backup once the notes have been quiet long
-    /// enough, and hand over whatever needs saying.
+    /// Every frame: start a sync once one is due, and hand over whatever
+    /// needs saying.
     fn poll(&mut self) -> PollResult {
         for (id, result) in self.host.finished() {
             self.task_done(id, result);
@@ -866,10 +875,10 @@ impl Plugin for NotesProvider {
             CMD_MOVE_DOWN.to_owned(),
             CMD_DUPLICATE.to_owned(),
         ];
-        // Offered only when cloud backup is on: restoring is meaningless
-        // otherwise, and an inert command in the palette is noise.
+        // Offered only when cloud sync is on: an inert command in the
+        // palette is noise.
         if self.cloud.is_enabled() {
-            out.push(CMD_RESTORE_BACKUP.to_owned());
+            out.push(CMD_SYNC_NOW.to_owned());
         }
         out
     }
@@ -879,37 +888,30 @@ impl Plugin for NotesProvider {
             CMD_MOVE_UP => localize::t("notes-cmd-move-up"),
             CMD_MOVE_DOWN => localize::t("notes-cmd-move-down"),
             CMD_DUPLICATE => localize::t("notes-cmd-duplicate"),
-            CMD_RESTORE_BACKUP => localize::t("notes-cmd-restore-backup"),
+            CMD_SYNC_NOW => localize::t("notes-cmd-sync-now"),
             other => other.to_owned(),
         }
     }
 
-    /// Pull the cloud backup back over empty notes.
+    /// Sync now, rather than at the next minute.
     ///
     /// Returns nothing so the palette closes back to the mode it was opened
-    /// from. The restore is a background task, and its outcome is spoken when
-    /// it ends ([`NotesProvider::task_done`]), because "nothing was restored" and
-    /// "restored" both need saying and only one of them is an error. Notes that
-    /// exist are refused here already, before anything reaches the network.
+    /// from. The sync is a background task, and what it brought in is spoken
+    /// when it ends ([`NotesProvider::task_done`]). On a new computer this is
+    /// how the notes come back: everything the server has is new here.
     fn handle_command(
         &mut self,
         cmd: &str,
         _elem_key: &str,
         _elem_type: i32,
     ) -> Result<Option<FfonElement>, String> {
-        if cmd != CMD_RESTORE_BACKUP {
-            return Ok(None);
+        if cmd == CMD_SYNC_NOW {
+            self.cloud.start_sync(&*self.host);
         }
-        self.ensure_loaded();
-        if !self.tree.notes.is_empty() || self.load_failed {
-            self.cloud.refuse_restore(&*self.host);
-            return Ok(None);
-        }
-        self.cloud.start_restore(&*self.host);
         Ok(None)
     }
 
-    /// The backup switch. The host passes on only this plugin's own settings.
+    /// The sync switch. The host passes on only this plugin's own settings.
     fn on_setting_change(&mut self, key: &str, value: &str) {
         self.cloud.on_setting_change(key, value, &*self.host);
     }
@@ -918,12 +920,23 @@ impl Plugin for NotesProvider {
 impl NotesProvider {
     /// A background task ([`cloud::PluginHost`] runs them on threads) ended.
     /// `poll` hands each one over, in the order they finished.
+    ///
+    /// A sync that merged another computer's notes in writes them to disk
+    /// here, and the tree is read again. Nothing was saved since the sync
+    /// started (the cloud checks), so nothing typed here is lost.
     pub fn task_done(&mut self, id: u64, result: Result<Vec<u8>, String>) {
-        if self.cloud.on_task_done(id, result, &*self.host) == Finished::Restored {
-            // The tree in memory is stale: re-read what the task wrote.
+        let Some(root) = self.root() else {
+            return;
+        };
+        if self.cloud.on_task_done(id, result, &*self.host, &root) == Finished::Reload {
+            // The tree in memory is stale: re-read what the sync wrote. The
+            // counter stays above every id this session handed out, which the
+            // undo timeline may still hold.
+            let floor = self.tree.next_id();
             self.loaded = false;
             self.load_failed = false;
             self.ensure_loaded();
+            self.tree.raise_counter(floor);
         }
     }
 }
@@ -931,8 +944,8 @@ impl NotesProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sicompass_payments::protocol::{Request, Response};
-    use sicompass_payments::row::Standing;
+    use sicompass_sync::protocol::{Request, Response};
+    use sicompass_sync::row::Standing;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use tempfile::TempDir;
@@ -1861,7 +1874,7 @@ mod tests {
     /// prefix. A missing one would show as its id.
     #[test]
     fn every_cloud_message_resolves() {
-        for id in sicompass_payments::cloud::MESSAGES {
+        for id in sicompass_sync::cloud::MESSAGES {
             let id = format!("notes-{id}");
             assert_ne!(localize::t(&id), id);
         }
@@ -2022,35 +2035,28 @@ mod tests {
         assert!(spoken.contains("Sicompass Cloud"), "{spoken}");
     }
 
-    /// The restore command is only worth offering once backup is on.
+    /// The sync command is only worth offering once sync is on.
     #[test]
-    fn the_restore_command_is_offered_only_with_backup_on() {
+    fn the_sync_command_is_offered_only_with_sync_on() {
         let dir = TempDir::new().unwrap();
         let p = provider(&dir);
-        assert!(!p.commands().contains(&CMD_RESTORE_BACKUP.to_owned()));
+        assert!(!p.commands().contains(&CMD_SYNC_NOW.to_owned()));
 
         let dir2 = TempDir::new().unwrap();
         let p = provider_with_cloud(&dir2, active_licence());
-        assert!(p.commands().contains(&CMD_RESTORE_BACKUP.to_owned()));
+        assert!(p.commands().contains(&CMD_SYNC_NOW.to_owned()));
     }
 
-    /// Restoring must never run over notes that are already here.
     #[test]
-    fn restore_refuses_to_overwrite_existing_notes() {
+    fn sync_now_starts_a_sync_at_once() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = cloud_on(&dir, &host);
-        sync(&mut p, vec![new_row("milk")]);
-
-        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
-
-        assert!(p.take_error().is_some(), "the refusal has to be reported");
-        assert!(
-            !host.spawned().iter().any(|(t, _)| t == cloud::TASK_RESTORE),
-            "refused before anything reaches the network"
+        p.handle_command(CMD_SYNC_NOW, "", 0).unwrap();
+        assert_eq!(
+            host.spawned(),
+            vec![(cloud::TASK_SYNC.to_owned(), Vec::new())]
         );
-        assert_eq!(p.tree.notes.len(), 1);
-        assert_eq!(p.tree.notes[0].text, "milk");
     }
 
     /// Switched on at start-up from the saved setting, nothing is announced:
@@ -2064,7 +2070,7 @@ mod tests {
         assert!(cloud::is_row(&labels_raw(&rows(&mut p))[0]));
     }
 
-    /// The backup row is rendered by the plugin, not a note the user can
+    /// The sync row is rendered by the plugin, not a note the user can
     /// delete. The switch in settings is what removes it.
     #[test]
     fn the_cloud_row_cannot_be_deleted() {
@@ -2075,245 +2081,301 @@ mod tests {
         assert!(p.take_error().is_some());
     }
 
-    // ---- Uploads ---------------------------------------------------------
+    // ---- Syncs -----------------------------------------------------------
 
-    /// An upload waits until the notes have been quiet for the debounce, and
-    /// then runs as a background task, never on the UI.
+    /// What a finished sync reports, as the task hands it back.
+    fn outcome(o: &sicompass_sync::sync::Outcome) -> Result<Vec<u8>, String> {
+        Ok(serde_json::to_vec(o).unwrap())
+    }
+
+    const UP_TO_DATE: sicompass_sync::sync::Outcome = sicompass_sync::sync::Outcome::UpToDate;
+
+    /// A sync runs at start-up, to pick up what another computer changed,
+    /// then a while after the notes go quiet, never on the UI.
     #[test]
-    fn a_backup_starts_once_the_notes_are_quiet() {
+    fn a_sync_runs_at_start_up_and_once_the_notes_are_quiet() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = cloud_on(&dir, &host);
-        sync(&mut p, vec![new_row("milk")]);
-
-        host.advance(1_000);
-        p.poll();
-        assert!(host.spawned().is_empty(), "still typing");
-
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS);
         let busy = p.poll().is_busy;
         assert_eq!(
             host.spawned(),
-            vec![(cloud::TASK_BACKUP.to_owned(), Vec::new())]
+            vec![(cloud::TASK_SYNC.to_owned(), Vec::new())]
         );
-        assert!(busy, "closing the tab now would lose the upload");
+        assert!(busy, "closing the tab now would lose the sync");
+        p.task_done(1, outcome(&UP_TO_DATE));
 
-        // Once is enough: nothing changed since.
-        host.advance(60_000);
+        sync(&mut p, vec![new_row("milk")]);
+        host.advance(1_000);
         p.poll();
-        assert_eq!(host.spawned().len(), 1);
+        assert_eq!(host.spawned().len(), 1, "still typing");
+
+        host.advance(sicompass_sync::debounce::DEBOUNCE_MS);
+        p.poll();
+        assert_eq!(host.spawned().len(), 2);
     }
 
-    /// The hash the server acknowledged travels with the next upload, so an
-    /// unchanged store costs nothing.
+    /// Another computer's changes arrive even when nothing is typed here.
     #[test]
-    fn the_next_backup_carries_the_last_hash() {
+    fn with_nothing_edited_it_looks_again_every_minute() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = cloud_on(&dir, &host);
-        sync(&mut p, vec![new_row("milk")]);
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
         p.poll();
-        p.task_done(1, Ok(b"abc".to_vec()));
-        assert!(!p.poll().is_busy);
-
-        let again = rows(&mut p);
-        sync(&mut p, again);
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        p.task_done(1, outcome(&UP_TO_DATE));
+        host.advance(sicompass_sync::cloud::POLL_MS - 1);
         p.poll();
-        assert_eq!(
-            host.spawned()[1],
-            (cloud::TASK_BACKUP.to_owned(), b"abc".to_vec())
-        );
+        assert_eq!(host.spawned().len(), 1);
+        host.advance(1);
+        p.poll();
+        assert_eq!(host.spawned().len(), 2);
     }
 
     /// The paywall is on the service: without a subscription the notes are
-    /// still saved, and only the upload does not happen.
+    /// still saved, and only the sync does not happen.
     #[test]
-    fn nothing_is_uploaded_without_a_subscription() {
+    fn nothing_is_synced_without_a_subscription() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(Standing::Missing);
         let mut p = cloud_on(&dir, &host);
         sync(&mut p, vec![new_row("milk")]);
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        host.advance(sicompass_sync::debounce::DEBOUNCE_MS + 1);
         p.poll();
         assert!(host.spawned().is_empty());
         assert!(store::load_tree(&dir.path().join("notes")).is_some_and(|t| t.notes.len() == 1));
     }
 
     #[test]
-    fn grace_keeps_the_backup_running() {
+    fn grace_keeps_the_sync_running() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(Standing::Grace { days_left: 3 });
         let mut p = cloud_on(&dir, &host);
         assert!(labels(&rows(&mut p))[0].contains('3'));
-        sync(&mut p, vec![new_row("milk")]);
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
         p.poll();
         assert_eq!(host.spawned().len(), 1);
     }
 
     #[test]
-    fn nothing_is_uploaded_with_the_switch_off() {
+    fn nothing_is_synced_with_the_switch_off() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = provider_on(&dir, &host);
         sync(&mut p, vec![new_row("milk")]);
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
+        host.advance(sicompass_sync::cloud::POLL_MS);
         p.poll();
         assert!(host.spawned().is_empty());
     }
 
     #[test]
-    fn a_failed_backup_is_reported_with_its_reason() {
+    fn a_failed_sync_is_reported_with_its_reason() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = cloud_on(&dir, &host);
         sync(&mut p, vec![new_row("milk")]);
-        host.advance(sicompass_payments::debounce::DEBOUNCE_MS + 1);
         p.poll();
         p.task_done(1, Err("That license has expired".to_owned()));
-        let error = p.poll().error.expect("a failed upload is said");
+        let error = p.poll().error.expect("a failed sync is said");
         assert!(error.contains("That license has expired"), "{error}");
         assert_eq!(p.tree.notes.len(), 1, "and the notes are untouched");
     }
 
-    // ---- Restore ---------------------------------------------------------
+    // ---- Another computer's changes ----------------------------------------
 
-    /// Over empty notes, the restore runs as a task; when it has written the
-    /// server's copy, the notes are read again and the outcome is spoken.
+    /// The store another computer would have, as a sync hands it over.
+    fn merged_store(texts: &[&str]) -> sicompass_sync::sync::Outcome {
+        let elsewhere = TempDir::new().unwrap();
+        let mut other = provider(&elsewhere);
+        sync(&mut other, texts.iter().map(|t| new_row(t)).collect());
+        let files = sicompass_sync::snapshot::read_store(&elsewhere.path().join("notes"), "notes")
+            .unwrap()
+            .files;
+        sicompass_sync::sync::Outcome::Apply {
+            files,
+            hash: "h-merged".to_owned(),
+            updated_at: Some(1),
+            conflicts: 0,
+        }
+    }
+
+    /// What a sync merged in is written, the notes are read again, and that
+    /// is said. On a new computer this is how the notes come back.
     #[test]
-    fn a_finished_restore_reloads_the_notes() {
+    fn a_merge_from_another_computer_reloads_the_notes() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = cloud_on(&dir, &host);
         p.fetch();
-        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
-        assert_eq!(
-            host.spawned(),
-            vec![(cloud::TASK_RESTORE.to_owned(), Vec::new())]
-        );
+        p.take_announcement();
+        p.poll();
 
-        // What the task wrote, from its own thread.
-        let mut elsewhere = provider(&dir);
-        sync(&mut elsewhere, vec![new_row("from the cloud")]);
-
-        p.task_done(1, Ok(b"restored".to_vec()));
+        p.task_done(1, outcome(&merged_store(&["from the cloud"])));
         let poll = p.poll();
         assert!(poll.needs_refresh);
-        assert!(poll.announcement.is_some_and(|a| a.contains("restored")));
+        assert_eq!(poll.announcement, Some(localize::t("notes-sync-pulled")));
         assert!(note_labels(&p.fetch()).contains(&"from the cloud".to_owned()));
     }
 
+    /// A merge computed before the user typed must not land over what they
+    /// typed: it is dropped, and the next sync merges again, edit included.
     #[test]
-    fn an_empty_backup_is_said_not_shown_as_an_error() {
+    fn a_merge_does_not_overwrite_an_edit_made_meanwhile() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = cloud_on(&dir, &host);
-        p.take_announcement();
-        p.handle_command(CMD_RESTORE_BACKUP, "", 0).unwrap();
-        p.task_done(1, Ok(b"empty".to_vec()));
-        let poll = p.poll();
-        assert!(poll.error.is_none());
-        assert_eq!(poll.announcement, Some(localize::t("notes-restore-empty")));
+        p.fetch();
+        p.poll();
+        sync(&mut p, vec![new_row("typed here")]);
+
+        p.task_done(1, outcome(&merged_store(&["from the cloud"])));
+        let shown = note_labels(&p.fetch());
+        assert!(shown.contains(&"typed here".to_owned()), "{shown:?}");
+        assert!(!shown.contains(&"from the cloud".to_owned()), "{shown:?}");
+        p.poll();
+        assert_eq!(host.spawned().len(), 2, "and it syncs again at once");
     }
 
-    // ---- The tasks themselves --------------------------------------------
+    /// Ids handed out before a merge stay handed out: the undo timeline may
+    /// still hold one for a deleted note.
+    #[test]
+    fn the_counter_stays_above_ids_handed_out_before_a_merge() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
+        sync(
+            &mut p,
+            vec![new_row("a"), new_row("b"), new_row("c"), new_row("d")],
+        );
+        p.poll();
+        let floor = p.tree.next_id();
+        p.task_done(1, outcome(&merged_store(&["x"])));
+        assert_eq!(p.tree.notes.len(), 1, "the merge landed");
+        assert_eq!(p.tree.notes[0].text, "x");
+        assert!(p.tree.next_id() >= floor);
+    }
+
+    /// The list meta says whether a list is as it was at the last sync, from
+    /// the same Merkle hash it shows.
+    #[test]
+    fn the_list_meta_says_whether_the_list_is_synced() {
+        let dir = TempDir::new().unwrap();
+        let host = FakeHost::new(active_licence());
+        let mut p = cloud_on(&dir, &host);
+        sync(&mut p, vec![new_row("milk")]);
+        let meta = |p: &mut NotesProvider| {
+            let m = labels(&enter(p, &localize::t("notes-list-meta")));
+            p.pop_path();
+            m
+        };
+        assert!(meta(&mut p).contains(&localize::t("notes-sync-status-new")));
+
+        // A sync that agreed on exactly this store.
+        let root = dir.path().join("notes");
+        let files = sicompass_sync::snapshot::read_store(&root, "notes")
+            .unwrap()
+            .files;
+        sicompass_sync::sync::Base {
+            hash: "h".to_owned(),
+            updated_at: None,
+            files,
+        }
+        .save(&root)
+        .unwrap();
+        p.cloud.load_base(&root);
+        assert!(meta(&mut p).contains(&localize::t("notes-sync-status-synced")));
+
+        let mut edited = rows(&mut p);
+        edited.push(new_row("eggs"));
+        sync(&mut p, edited);
+        assert!(meta(&mut p).contains(&localize::t("notes-sync-status-changed")));
+    }
+
+    #[test]
+    fn no_sync_line_in_the_list_meta_while_sync_is_off() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider(&dir);
+        sync(&mut p, vec![new_row("milk")]);
+        let meta = labels(&enter(&mut p, &localize::t("notes-list-meta")));
+        assert!(!meta.iter().any(|l| l.starts_with("cloud")), "{meta:?}");
+    }
+
+    // ---- The task itself ---------------------------------------------------
 
     type Sent = Rc<RefCell<Vec<Request>>>;
 
-    /// A server that answers every request with `status` and `body`, and logs
-    /// what it was sent.
-    fn server(status: u16, body: &str) -> (impl Fn(&Request) -> Result<Response, String>, Sent) {
+    /// A server with nothing stored that takes every upload, and logs what it
+    /// was sent.
+    fn empty_server() -> (impl Fn(&Request) -> Result<Response, String>, Sent) {
         let sent: Sent = Rc::default();
         let log = sent.clone();
-        let body = body.as_bytes().to_vec();
         let send = move |r: &Request| {
             log.borrow_mut().push(r.clone());
-            Ok(Response {
-                status,
-                body: body.clone(),
-            })
+            let body = if r.method == "GET" {
+                br#"{"hash":null,"updated_at":null,"now":1}"#.to_vec()
+            } else {
+                br#"{"stored":true,"updated_at":1}"#.to_vec()
+            };
+            Ok(Response { status: 200, body })
         };
         (send, sent)
     }
 
     #[test]
-    fn the_backup_task_uploads_the_store_and_returns_its_hash() {
+    fn the_sync_task_uploads_the_notes_to_their_server() {
         let dir = TempDir::new().unwrap();
         let mut p = provider(&dir);
         sync(&mut p, vec![new_row("milk")]);
         let root = dir.path().join("notes");
 
-        let (send, sent) = server(200, r#"{"stored":true}"#);
-        let hash = sicompass_payments::cloud::run_backup(
-            &cloud::SERVICE,
-            &root,
-            b"",
-            Some("tok-42".to_owned()),
-            &send,
-        )
-        .unwrap();
-        assert!(!hash.is_empty());
-        {
-            let sent = sent.borrow();
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].method, "PUT");
-            assert_eq!(sent[0].url, "https://store.sicompass.org/plugins/notes");
-            assert!(
-                sent[0]
-                    .headers
-                    .contains(&("Authorization".to_owned(), "Bearer tok-42".to_owned()))
-            );
-        }
+        let (send, sent) = empty_server();
+        sicompass_sync::cloud::run_sync(&cloud::SERVICE, &root, Some("tok-42".to_owned()), &send)
+            .unwrap();
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent[0].url,
+            "https://store.sicompass.org/plugins/notes/head"
+        );
+        assert_eq!(sent[1].method, "PUT");
+        assert_eq!(sent[1].url, "https://store.sicompass.org/plugins/notes");
+        assert!(
+            sent[1]
+                .headers
+                .contains(&("Authorization".to_owned(), "Bearer tok-42".to_owned()))
+        );
+    }
 
-        // Unchanged since: no request at all.
-        let again = sicompass_payments::cloud::run_backup(
-            &cloud::SERVICE,
-            &root,
-            &hash,
-            Some("tok-42".to_owned()),
-            &send,
-        )
-        .unwrap();
-        assert!(again.is_empty());
-        assert_eq!(sent.borrow().len(), 1);
+    /// The notes as saved are already the canonical form, every hash right:
+    /// what the sync uploads is byte for byte what is on disk.
+    #[test]
+    fn the_saved_notes_are_what_the_sync_uploads() {
+        let dir = TempDir::new().unwrap();
+        let mut p = provider(&dir);
+        sync(&mut p, vec![new_branch_row("Groceries"), new_row("Ideas")]);
+        enter(&mut p, "Groceries");
+        sync(&mut p, vec![new_row("milk")]);
+        let saved =
+            sicompass_sync::snapshot::read_store(&dir.path().join("notes"), "notes").unwrap();
+        assert_eq!(
+            sicompass_sync::merkle::verify(&saved.files),
+            sicompass_sync::merkle::Verified::Ok
+        );
+        assert_eq!(sicompass_sync::snapshot::canonical(&saved), saved);
     }
 
     #[test]
-    fn the_backup_task_needs_a_redeemed_token() {
+    fn the_sync_task_needs_a_redeemed_token() {
         let dir = TempDir::new().unwrap();
         let mut p = provider(&dir);
         sync(&mut p, vec![new_row("milk")]);
-        let (send, sent) = server(200, "{}");
-        let err = sicompass_payments::cloud::run_backup(
+        let (send, sent) = empty_server();
+        let err = sicompass_sync::cloud::run_sync(
             &cloud::SERVICE,
             &dir.path().join("notes"),
-            b"",
             None,
             &send,
         )
         .unwrap_err();
         assert!(err.contains("store, tiers"), "{err}");
-        assert!(sent.borrow().is_empty());
-    }
-
-    /// The last line of defence: even if the UI let it through, the task
-    /// itself never restores over notes that exist.
-    #[test]
-    fn the_restore_task_refuses_a_store_with_notes() {
-        let dir = TempDir::new().unwrap();
-        let mut p = provider(&dir);
-        sync(&mut p, vec![new_row("milk")]);
-        let (send, sent) = server(200, "{}");
-        let err = sicompass_payments::cloud::run_restore(
-            &cloud::SERVICE,
-            &dir.path().join("notes"),
-            Some("tok".to_owned()),
-            &send,
-        )
-        .unwrap_err();
-        assert_eq!(err, sicompass_payments::protocol::RESTORE_REFUSED);
         assert!(sent.borrow().is_empty());
     }
 }
