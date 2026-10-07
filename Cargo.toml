@@ -3,7 +3,7 @@
 
 [package]
 name = "notes-plugin"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Notes for sicompass: a hashed tree of the user's own writing, with optional cloud sync, as a plugin"

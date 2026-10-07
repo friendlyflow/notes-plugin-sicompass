@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+Cloud backup is cloud sync now. Your notes stay the same on every computer you turn it on for.
+
+- A few seconds after you stop typing, once a minute, and when you choose sync with the cloud now, your changes go to Sicompass Cloud and the changes you made on your other computers come in. On a new computer, turning sync on brings your notes in, so the restore command is gone.
+- When the same line was changed on two computers, the latest change is kept, and a note deleted on one computer and edited on another is kept.
+- The list meta of every list says whether it changed since the last sync, next to its hash.
+- The switch in Settings is worded enable cloud sync, and stays on if you had cloud backup on.
+- The hashes are the same as before, so nothing is rewritten.
+
 ## 0.3.0
 
 Notes is a program of its own now, instead of a sandboxed WebAssembly component.
