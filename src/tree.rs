@@ -5,7 +5,7 @@
 //! These digests are the whole point of the tree: a server can compare one root
 //! hash instead of diffing documents. That only works if both sides compute the
 //! same bytes, so the definition below is a contract, not an implementation
-//! detail. Changing it invalidates every stored `.listmeta` and every
+//! detail. Changing it invalidates every stored `.header` and every
 //! comparison a peer has already made. It is `sicompass_sync::merkle`'s, which
 //! the board plugin and the sync server share; this module only applies it.
 //!

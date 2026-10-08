@@ -10,9 +10,9 @@ can hold more lists, as deep as you like. You add, rename, move, cut and paste
 notes with the same keys as everywhere else in Sicompass, and every change can
 be undone.
 
-Every list opens with a list meta row. It shows a SHA-256 hash of that list and
+Every list opens with a header row. It shows a SHA-256 hash of that list and
 everything below it, so a glance at the top of your notes tells you whether
-anything anywhere has changed. Inside a note's own list meta you can set it to
+anything anywhere has changed. Inside a note's own header you can set it to
 private or public. New notes are private.
 
 Your notes are plain files in your Sicompass data folder, on your own
@@ -26,9 +26,9 @@ notes stay the same on every computer you turn it on for. A few seconds after
 you stop typing, and once a minute otherwise, Sicompass sends your changes to
 the Sicompass Cloud server and brings in the changes you made elsewhere.
 
-Every note has a hash, shown in its list meta, that changes whenever anything
+Every note has a hash, shown in its header, that changes whenever anything
 in it changes. That is how Sicompass and the server know which notes are out
-of date, and the list meta also says whether a list changed since the last
+of date, and the header also says whether a list changed since the last
 sync. When the same line was changed on two computers, the latest change is
 kept. A note deleted on one computer and edited on another is kept.
 

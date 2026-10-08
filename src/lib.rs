@@ -78,21 +78,22 @@ pub const CMD_DUPLICATE: &str = "duplicate";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Segment {
     Node(NodeId),
-    /// The `list meta:` row, which is a rendered header rather than a node.
-    Meta,
+    /// The `header:` row, which is rendered rather than a node. Its token is
+    /// still `m`, from when it was called the list meta: the app keeps paths.
+    Header,
 }
 
 impl Segment {
     fn token(self) -> String {
         match self {
             Segment::Node(id) => format!("n{id}"),
-            Segment::Meta => "m".to_owned(),
+            Segment::Header => "m".to_owned(),
         }
     }
 
     fn from_token(tok: &str) -> Option<Segment> {
         if tok == "m" {
-            return Some(Segment::Meta);
+            return Some(Segment::Header);
         }
         tok.strip_prefix('n')
             .and_then(|n| n.parse().ok())
@@ -240,26 +241,26 @@ impl NotesProvider {
         self.cloud.mark_dirty(&*self.host);
     }
 
-    /// The node-id chain for the current level, ignoring a trailing `Meta`.
+    /// The node-id chain for the current level, ignoring a trailing `Header`.
     fn node_path(&self) -> Vec<NodeId> {
         self.segments
             .iter()
             .filter_map(|s| match s {
                 Segment::Node(id) => Some(*id),
-                Segment::Meta => None,
+                Segment::Header => None,
             })
             .collect()
     }
 
-    fn in_meta(&self) -> bool {
-        matches!(self.segments.last(), Some(Segment::Meta))
+    fn in_header(&self) -> bool {
+        matches!(self.segments.last(), Some(Segment::Header))
     }
 
     /// The top-level note the cursor is inside, which is what owns visibility.
     fn owning_note(&self) -> Option<&Node> {
         let first = self.segments.iter().find_map(|s| match s {
             Segment::Node(id) => Some(*id),
-            Segment::Meta => None,
+            Segment::Header => None,
         })?;
         self.tree.notes.iter().find(|n| n.id == first)
     }
@@ -311,22 +312,22 @@ impl NotesProvider {
         }
     }
 
-    /// The `list meta:` header for the current level.
+    /// The `header:` row for the current level.
     ///
     /// Its key must stay localized, and must therefore never be literally
     /// `"meta"`: the app special-cases an Obj keyed exactly `"meta"` and skips
     /// `pop_path` when leaving it, which would leave this provider's path one
     /// segment deeper than the cursor.
-    fn meta_row(&self) -> FfonElement {
-        FfonElement::new_obj(localize::t("notes-list-meta"))
+    fn header_row(&self) -> FfonElement {
+        FfonElement::new_obj(localize::t("notes-header"))
     }
 
-    fn meta_children(&self) -> Vec<FfonElement> {
+    fn header_children(&self) -> Vec<FfonElement> {
         let mut out = Vec::new();
 
         // Visibility belongs to the note, so it is offered on the note's own
-        // list and nowhere deeper: `[Node(note), Meta]` is length two. The root
-        // meta is `[Meta]`, length one, and a sublist's is longer; neither
+        // list and nowhere deeper: `[Node(note), Header]` is length two. The root
+        // header is `[Header]`, length one, and a sublist's is longer; neither
         // carries the switch. A sublist inherits its note's setting, and the
         // root is not a note at all.
         if self.segments.len() == 2
@@ -368,8 +369,8 @@ impl NotesProvider {
         let level = self.segments.clone();
         self.forget_level(&level);
 
-        if self.in_meta() {
-            return self.meta_children();
+        if self.in_header() {
+            return self.header_children();
         }
 
         let path = self.node_path();
@@ -377,12 +378,12 @@ impl NotesProvider {
             return vec![FfonElement::new_str(localize::t("notes-gone"))];
         };
 
-        // Every list opens with its meta, the root included. At the root the
-        // meta carries the tree's root hash and nothing else, so a glance at
+        // Every list opens with its header, the root included. At the root the
+        // header carries the tree's root hash and nothing else, so a glance at
         // the first row says whether anything anywhere below has changed —
         // which is the whole point of chaining the hashes.
         let mut out = Vec::with_capacity(nodes.len() + 2);
-        // Above the meta, and only at the root: one row per provider, in one
+        // Above the header, and only at the root: one row per provider, in one
         // place, whether or not the subscription is paid for. The notes
         // themselves are listed below it either way.
         if path.is_empty()
@@ -390,10 +391,10 @@ impl NotesProvider {
         {
             out.push(row);
         }
-        let meta = self.meta_row();
-        let key = meta.as_obj().map(|o| o.key.clone()).unwrap_or_default();
-        self.remember(&level, &key, Segment::Meta);
-        out.push(meta);
+        let header = self.header_row();
+        let key = header.as_obj().map(|o| o.key.clone()).unwrap_or_default();
+        self.remember(&level, &key, Segment::Header);
+        out.push(header);
         for node in &nodes {
             let elem = Self::row(node);
             let key = match &elem {
@@ -432,7 +433,7 @@ impl NotesProvider {
         if self.load_failed {
             return;
         }
-        // A meta row is rendered, not stored, and the app may hand it straight
+        // A header row is rendered, not stored, and the app may hand it straight
         // back. Filtering it here is also what makes it un-reorderable: it is
         // re-inserted at index 0 on the next fetch no matter where it was.
         // Rows this provider renders but does not store. The app hands back
@@ -440,7 +441,7 @@ impl NotesProvider {
         // would become the user's first note the moment they wrote their
         // second one.
         let rendered_only = [
-            localize::t("notes-list-meta"),
+            localize::t("notes-header"),
             localize::t("notes-empty"),
             localize::t("notes-gone"),
         ];
@@ -667,15 +668,15 @@ impl Plugin for NotesProvider {
     /// Where every edit lands. See the module docs.
     fn sync_ffon_body_children(&mut self, children: &[FfonElement]) {
         self.ensure_loaded();
-        // The meta level holds rendered controls, not notes; a radio toggle
+        // The header level holds rendered controls, not notes; a radio toggle
         // there arrives through `on_radio_change` instead.
-        if self.in_meta() {
+        if self.in_header() {
             return;
         }
         self.reconcile(children);
     }
 
-    /// Accept the typed text, and veto an edit aimed at the meta row.
+    /// Accept the typed text, and veto an edit aimed at the header row.
     ///
     /// The rename itself is done by `sync_ffon_body_children`, which the app
     /// calls right after this with the whole list and its ids.
@@ -684,8 +685,8 @@ impl Plugin for NotesProvider {
             self.error = Some(localize::t("notes-error-unreadable"));
             return false;
         }
-        if old == localize::t("notes-list-meta") {
-            self.error = Some(localize::t("notes-error-meta-readonly"));
+        if old == localize::t("notes-header") {
+            self.error = Some(localize::t("notes-error-header-readonly"));
             return false;
         }
         if old.is_empty() {
@@ -708,15 +709,15 @@ impl Plugin for NotesProvider {
 
     /// The veto the app asks for before removing a row.
     ///
-    /// `name` is the raw element text, tags intact, so the meta row is
+    /// `name` is the raw element text, tags intact, so the header row is
     /// recognisable by its key.
     fn delete_item(&mut self, name: &str) -> bool {
         if self.load_failed {
             self.error = Some(localize::t("notes-error-unreadable"));
             return false;
         }
-        if name == localize::t("notes-list-meta") {
-            self.error = Some(localize::t("notes-error-meta-undeletable"));
+        if name == localize::t("notes-header") {
+            self.error = Some(localize::t("notes-error-header-undeletable"));
             return false;
         }
         // The backup row is the switch's, in settings, not a note.
@@ -729,14 +730,14 @@ impl Plugin for NotesProvider {
         true
     }
 
-    /// The visibility switch, which `meta_children` offers in exactly one
-    /// place: a note's own meta list, `[Node(note), Meta]`.
+    /// The visibility switch, which `header_children` offers in exactly one
+    /// place: a note's own header, `[Node(note), Header]`.
     ///
     /// Routing on position rather than on the value matters: every value that
     /// is not "private" counts as "public", so a radio from anywhere else must
     /// never reach the note.
     fn on_radio_change(&mut self, _group: &str, value: &str) {
-        if !(self.segments.len() == 2 && self.in_meta()) {
+        if !(self.segments.len() == 2 && self.in_header()) {
             return;
         }
         let private = localize::t("notes-visibility-private");
@@ -861,7 +862,7 @@ impl Plugin for NotesProvider {
     /// stopped at the first level and the tab reopened at the root.
     fn fetch_subtree_parent_key(&mut self) -> Option<String> {
         match *self.segments.last()? {
-            Segment::Meta => Some(localize::t("notes-list-meta")),
+            Segment::Header => Some(localize::t("notes-header")),
             Segment::Node(id) => {
                 self.ensure_loaded();
                 Node::find(&self.tree.notes, id).map(Self::row_label)
@@ -1079,16 +1080,16 @@ mod tests {
 
     /// The rows the provider currently renders for this level, verbatim — what
     /// the app would hand back unchanged if the user changed nothing. Includes
-    /// the `list meta:` header, because the app hands that back too.
+    /// the `header:` row, because the app hands that back too.
     fn rows(p: &mut NotesProvider) -> Vec<FfonElement> {
         p.fetch()
     }
 
-    /// The display text of the note rows only, with the meta header dropped.
+    /// The display text of the note rows only, with the header dropped.
     fn note_labels(elems: &[FfonElement]) -> Vec<String> {
         labels(elems)
             .into_iter()
-            .filter(|l| *l != localize::t("notes-list-meta"))
+            .filter(|l| *l != localize::t("notes-header"))
             .collect()
     }
 
@@ -1105,39 +1106,39 @@ mod tests {
 
     // ---- Shape -----------------------------------------------------------
 
-    /// The root's meta is what makes the chain useful: one row, read first,
+    /// The root's header is what makes the chain useful: one row, read first,
     /// that changes if anything anywhere in the tree changed.
     #[test]
-    fn the_top_level_list_opens_with_its_list_meta_too() {
+    fn the_top_level_list_opens_with_its_header_too() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_row("Groceries")]);
         assert_eq!(
             labels(&p.fetch()),
-            vec![localize::t("notes-list-meta"), "Groceries".to_owned()]
+            vec![localize::t("notes-header"), "Groceries".to_owned()]
         );
     }
 
     #[test]
-    fn the_root_meta_shows_the_root_hash_and_offers_no_visibility() {
+    fn the_root_header_shows_the_root_hash_and_offers_no_visibility() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_row("Groceries")]);
-        let meta = enter(&mut p, &localize::t("notes-list-meta"));
+        let header = enter(&mut p, &localize::t("notes-header"));
 
         assert!(
-            !meta
+            !header
                 .iter()
                 .any(|e| matches!(e, FfonElement::Obj(o) if tags::has_radio(&o.key))),
             "the root is not a note, so there is nothing to publish: {:?}",
-            labels(&meta)
+            labels(&header)
         );
         assert!(
-            labels(&meta)
+            labels(&header)
                 .iter()
                 .any(|l| l.contains(&p.tree.root_hash_hex())),
             "the root hash is on show: {:?}",
-            labels(&meta)
+            labels(&header)
         );
     }
 
@@ -1199,9 +1200,9 @@ mod tests {
         let before = p.tree.root_hash_hex();
 
         let mut kept = rows(&mut p);
-        let meta = kept.remove(0);
+        let header = kept.remove(0);
         kept.swap(0, 1);
-        kept.insert(0, meta);
+        kept.insert(0, header);
         sync(&mut p, kept);
 
         assert_eq!(
@@ -1216,16 +1217,16 @@ mod tests {
     }
 
     #[test]
-    fn every_list_below_the_top_level_opens_with_its_list_meta() {
+    fn every_list_below_the_top_level_opens_with_its_header() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
         let inside = enter(&mut p, "Groceries");
-        assert_eq!(labels(&inside)[0], localize::t("notes-list-meta"));
+        assert_eq!(labels(&inside)[0], localize::t("notes-header"));
     }
 
     #[test]
-    fn a_deeper_list_also_opens_with_its_list_meta() {
+    fn a_deeper_list_also_opens_with_its_header() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
@@ -1234,7 +1235,7 @@ mod tests {
         kept.push(new_branch_row("Weekend"));
         sync(&mut p, kept);
         let inside = enter(&mut p, "Weekend");
-        assert_eq!(labels(&inside)[0], localize::t("notes-list-meta"));
+        assert_eq!(labels(&inside)[0], localize::t("notes-header"));
     }
 
     #[test]
@@ -1262,13 +1263,13 @@ mod tests {
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
         enter(&mut p, "Groceries");
-        let note_meta = enter(&mut p, &localize::t("notes-list-meta"));
+        let note_header = enter(&mut p, &localize::t("notes-header"));
         assert!(
-            note_meta
+            note_header
                 .iter()
                 .any(|e| matches!(e, FfonElement::Obj(o) if tags::has_radio(&o.key))),
             "a note's own list offers visibility: {:?}",
-            labels(&note_meta)
+            labels(&note_header)
         );
 
         // One level deeper: the hash, and no second visibility switch.
@@ -1279,13 +1280,13 @@ mod tests {
         kept.push(new_branch_row("Weekend"));
         sync(&mut p, kept);
         enter(&mut p, "Weekend");
-        let sub_meta = enter(&mut p, &localize::t("notes-list-meta"));
+        let sub_header = enter(&mut p, &localize::t("notes-header"));
         assert!(
-            !sub_meta
+            !sub_header
                 .iter()
                 .any(|e| matches!(e, FfonElement::Obj(o) if tags::has_radio(&o.key))),
             "a sublist inherits its note's visibility: {:?}",
-            labels(&sub_meta)
+            labels(&sub_header)
         );
     }
 
@@ -1297,7 +1298,7 @@ mod tests {
         let before = p.tree.root_hash_hex();
 
         enter(&mut p, "Groceries");
-        enter(&mut p, &localize::t("notes-list-meta"));
+        enter(&mut p, &localize::t("notes-header"));
         p.on_radio_change("visibility", &localize::t("notes-visibility-public"));
 
         assert_eq!(p.tree.notes[0].visibility, Some(Visibility::Public));
@@ -1409,7 +1410,7 @@ mod tests {
 
     #[test]
     fn every_segment_round_trips_through_its_token() {
-        for seg in [Segment::Node(1), Segment::Node(9_999), Segment::Meta] {
+        for seg in [Segment::Node(1), Segment::Node(9_999), Segment::Header] {
             assert_eq!(Segment::from_token(&seg.token()), Some(seg));
         }
         assert_eq!(Segment::from_token("nonsense"), None);
@@ -1548,48 +1549,48 @@ mod tests {
         );
     }
 
-    // ---- The protected meta row -----------------------------------------
+    // ---- The protected header row -----------------------------------------
 
     #[test]
-    fn the_list_meta_row_refuses_to_be_deleted() {
+    fn the_header_row_refuses_to_be_deleted() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
         enter(&mut p, "Groceries");
         assert!(
-            !p.delete_item(&localize::t("notes-list-meta")),
-            "the meta row belongs to the list, not to the user"
+            !p.delete_item(&localize::t("notes-header")),
+            "the header row belongs to the list, not to the user"
         );
         assert!(p.take_error().is_some(), "and says why");
     }
 
     #[test]
-    fn the_list_meta_row_refuses_to_be_edited() {
+    fn the_header_row_refuses_to_be_edited() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
         enter(&mut p, "Groceries");
-        assert!(!p.commit_edit(&localize::t("notes-list-meta"), "something else"));
+        assert!(!p.commit_edit(&localize::t("notes-header"), "something else"));
     }
 
     #[test]
-    fn a_meta_row_handed_back_is_not_stored_as_a_note() {
+    fn a_header_row_handed_back_is_not_stored_as_a_note() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
         enter(&mut p, "Groceries");
-        // The app hands back exactly what it was rendering, meta row included.
+        // The app hands back exactly what it was rendering, header row included.
         let kept = rows(&mut p);
         sync(&mut p, kept);
         assert!(
             p.tree.notes[0].children.is_empty(),
-            "the meta row is rendered, not stored: {:?}",
+            "the header row is rendered, not stored: {:?}",
             p.tree.notes[0].children
         );
     }
 
     #[test]
-    fn the_meta_row_is_pinned_back_to_the_top_after_a_reorder() {
+    fn the_header_row_is_pinned_back_to_the_top_after_a_reorder() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
@@ -1598,14 +1599,14 @@ mod tests {
         kept.push(new_row("milk"));
         sync(&mut p, kept);
 
-        // The user drags the meta row to the bottom, or the app hands it back
+        // The user drags the header row to the bottom, or the app hands it back
         // in a different order after some edit.
         let mut shuffled = rows(&mut p);
-        let meta = shuffled.remove(0);
-        shuffled.push(meta);
+        let header = shuffled.remove(0);
+        shuffled.push(header);
         sync(&mut p, shuffled);
 
-        assert_eq!(labels(&p.fetch())[0], localize::t("notes-list-meta"));
+        assert_eq!(labels(&p.fetch())[0], localize::t("notes-header"));
     }
 
     // ---- Escaping --------------------------------------------------------
@@ -1689,7 +1690,7 @@ mod tests {
             std::fs::read_to_string(root.join("0001.d").join("0001")).unwrap(),
             "milk"
         );
-        assert!(root.join("0001.d").join(store::LISTMETA).is_file());
+        assert!(root.join("0001.d").join(store::HEADER).is_file());
     }
 
     #[test]
@@ -1751,12 +1752,60 @@ mod tests {
         let mut p = provider(&d);
         sync(&mut p, vec![new_branch_row("Groceries")]);
         enter(&mut p, "Groceries");
-        enter(&mut p, &localize::t("notes-list-meta"));
+        enter(&mut p, &localize::t("notes-header"));
         p.on_radio_change("visibility", &localize::t("notes-visibility-public"));
 
         let mut q = provider(&d);
         q.fetch();
         assert_eq!(q.tree.notes[0].visibility, Some(Visibility::Public));
+    }
+
+    /// The name of every dot file under `dir`: the sidecars.
+    fn sidecars(dir: &std::path::Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                sidecars(&path, out);
+            } else if name.starts_with('.') {
+                out.push(name);
+            }
+        }
+    }
+
+    /// A store saved before the sidecar was renamed, every `.header` still a
+    /// `.listmeta`: it loads with its ids and visibility, and the next save
+    /// leaves only `.header` files.
+    #[test]
+    fn a_store_under_the_old_sidecar_name_loads_and_is_renamed_by_a_save() {
+        let d = TempDir::new().unwrap();
+        let root = d.path().join("notes");
+        let mut p = provider(&d);
+        sync(&mut p, vec![new_branch_row("Groceries"), new_row("Ideas")]);
+        enter(&mut p, "Groceries");
+        let mut kept = rows(&mut p);
+        kept.push(new_row("milk"));
+        sync(&mut p, kept);
+        enter(&mut p, &localize::t("notes-header"));
+        p.on_radio_change("visibility", &localize::t("notes-visibility-public"));
+        let hash = p.tree.root_hash_hex();
+        let ids: Vec<NodeId> = p.tree.notes.iter().map(|n| n.id).collect();
+        for dir in [root.clone(), root.join("0001.d")] {
+            std::fs::rename(dir.join(store::HEADER), dir.join(store::LEGACY_HEADER)).unwrap();
+        }
+
+        let mut q = provider(&d);
+        q.fetch();
+        assert_eq!(q.tree.root_hash_hex(), hash);
+        assert_eq!(q.tree.notes.iter().map(|n| n.id).collect::<Vec<_>>(), ids);
+        assert_eq!(q.tree.notes[0].visibility, Some(Visibility::Public));
+
+        let mut kept = rows(&mut q);
+        kept.push(new_row("Later"));
+        sync(&mut q, kept);
+        let mut found = Vec::new();
+        sidecars(&root, &mut found);
+        assert_eq!(found, [store::HEADER, store::HEADER]);
     }
 
     #[test]
@@ -1883,8 +1932,8 @@ mod tests {
     /// The app skips `pop_path` when leaving an `Obj` keyed exactly `"meta"`,
     /// which would leave this provider's path a level deeper than the cursor.
     #[test]
-    fn the_meta_rows_key_is_never_the_bare_word_meta() {
-        assert_ne!(localize::t("notes-list-meta"), "meta");
+    fn the_header_rows_key_is_never_the_bare_word_meta() {
+        assert_ne!(localize::t("notes-header"), "meta");
     }
 
     // -----------------------------------------------------------------------
@@ -2005,10 +2054,10 @@ mod tests {
         );
     }
 
-    /// Only the visibility switch in a note's own meta list may publish it. A
+    /// Only the visibility switch in a note's own header may publish it. A
     /// radio from anywhere else must never change who can see a note.
     #[test]
-    fn a_radio_outside_the_note_meta_does_not_publish_a_note() {
+    fn a_radio_outside_the_note_header_does_not_publish_a_note() {
         let dir = TempDir::new().unwrap();
         let mut p = provider_with_cloud(&dir, active_licence());
         sync(&mut p, vec![new_branch_row("Groceries")]);
@@ -2253,20 +2302,20 @@ mod tests {
         assert!(p.tree.next_id() >= floor);
     }
 
-    /// The list meta says whether a list is as it was at the last sync, from
+    /// The header says whether a list is as it was at the last sync, from
     /// the same Merkle hash it shows.
     #[test]
-    fn the_list_meta_says_whether_the_list_is_synced() {
+    fn the_header_says_whether_the_list_is_synced() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(active_licence());
         let mut p = cloud_on(&dir, &host);
         sync(&mut p, vec![new_row("milk")]);
-        let meta = |p: &mut NotesProvider| {
-            let m = labels(&enter(p, &localize::t("notes-list-meta")));
+        let header = |p: &mut NotesProvider| {
+            let m = labels(&enter(p, &localize::t("notes-header")));
             p.pop_path();
             m
         };
-        assert!(meta(&mut p).contains(&localize::t("notes-sync-status-new")));
+        assert!(header(&mut p).contains(&localize::t("notes-sync-status-new")));
 
         // A sync that agreed on exactly this store.
         let root = dir.path().join("notes");
@@ -2281,21 +2330,21 @@ mod tests {
         .save(&root)
         .unwrap();
         p.cloud.load_base(&root);
-        assert!(meta(&mut p).contains(&localize::t("notes-sync-status-synced")));
+        assert!(header(&mut p).contains(&localize::t("notes-sync-status-synced")));
 
         let mut edited = rows(&mut p);
         edited.push(new_row("eggs"));
         sync(&mut p, edited);
-        assert!(meta(&mut p).contains(&localize::t("notes-sync-status-changed")));
+        assert!(header(&mut p).contains(&localize::t("notes-sync-status-changed")));
     }
 
     #[test]
-    fn no_sync_line_in_the_list_meta_while_sync_is_off() {
+    fn no_sync_line_in_the_header_while_sync_is_off() {
         let dir = TempDir::new().unwrap();
         let mut p = provider(&dir);
         sync(&mut p, vec![new_row("milk")]);
-        let meta = labels(&enter(&mut p, &localize::t("notes-list-meta")));
-        assert!(!meta.iter().any(|l| l.starts_with("cloud")), "{meta:?}");
+        let header = labels(&enter(&mut p, &localize::t("notes-header")));
+        assert!(!header.iter().any(|l| l.starts_with("cloud")), "{header:?}");
     }
 
     // ---- The task itself ---------------------------------------------------

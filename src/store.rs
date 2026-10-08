@@ -2,14 +2,14 @@
 //!
 //! ```text
 //! notes/
-//! |-- .listmeta        {"sha256":"6f2c...","children":[{"n":1,"id":7,"sha256":"a3f1..."}]}
+//! |-- .header          {"sha256":"6f2c...","children":[{"n":1,"id":7,"sha256":"a3f1..."}]}
 //! |-- 0001             "Groceries"                     a branch's own file
 //! |-- 0001.d/                                          its children
-//! |   |-- .listmeta    {"visibility":"private","sha256":"a3f1...","children":[...]}
+//! |   |-- .header      {"visibility":"private","sha256":"a3f1...","children":[...]}
 //! |   |-- 0001         "milk"                          a leaf
 //! |   |-- 0002         "Weekend"
 //! |   `-- 0002.d/
-//! |       |-- .listmeta
+//! |       |-- .header
 //! |       `-- 0001     "bread"
 //! `-- 0002             "Ideas"
 //! ```
@@ -17,12 +17,15 @@
 //! A file's contents are the element's text, verbatim, with no trailing
 //! newline. The `NNNN` prefix carries order and nothing else: it is renumbered
 //! densely on every insert, delete and reorder so that `ls` order is list
-//! order. Identity lives in `.listmeta`, not in the name, which is why renaming
+//! order. Identity lives in `.header`, not in the name, which is why renaming
 //! a note does not have to cascade through its ancestors.
 //!
 //! `.d` is what keeps the layout legal: POSIX will not hold a file and a
 //! directory of the same name in one parent, so a branch's children go in a
 //! sibling folder rather than one named after its own file.
+//!
+//! The sidecar used to be called `.listmeta`. A folder that still has one is
+//! read from it, and the next save writes `.header` and removes it.
 
 use crate::tree::{Node, NodeId, Tree, Visibility};
 use serde::{Deserialize, Serialize};
@@ -30,7 +33,11 @@ use std::path::{Path, PathBuf};
 
 /// The sidecar. Named with a leading dot so it sorts away from the numbered
 /// entries and is skipped by the `NNNN` filter on load.
-pub const LISTMETA: &str = ".listmeta";
+pub const HEADER: &str = ".header";
+
+/// What [`HEADER`] was called before: read when there is no `.header`, and
+/// removed by the next save.
+pub const LEGACY_HEADER: &str = ".listmeta";
 
 /// Suffix for a branch's children folder.
 pub const CHILD_DIR_SUFFIX: &str = ".d";
@@ -44,7 +51,7 @@ pub struct ChildMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ListMeta {
+pub struct ListHeader {
     /// The hash of the node that owns this list, or the root hash at the top.
     pub sha256: String,
     /// Present only on a top-level note's own folder.
@@ -65,7 +72,7 @@ fn child_dir_name(n: usize) -> String {
 }
 
 /// A `NNNN` entry name back to its position, or `None` for anything else
-/// (`.listmeta`, a `.d` folder, a stray file a user dropped in).
+/// (`.header`, a `.d` folder, a stray file a user dropped in).
 fn parse_entry_name(name: &str) -> Option<usize> {
     if name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit()) {
         name.parse().ok()
@@ -101,8 +108,10 @@ pub fn load_tree(root: &Path) -> Option<Tree> {
     Some(tree)
 }
 
-fn read_listmeta(dir: &Path) -> Option<ListMeta> {
-    let raw = std::fs::read_to_string(dir.join(LISTMETA)).ok()?;
+fn read_header(dir: &Path) -> Option<ListHeader> {
+    let raw = std::fs::read_to_string(dir.join(HEADER))
+        .or_else(|_| std::fs::read_to_string(dir.join(LEGACY_HEADER)))
+        .ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -110,7 +119,7 @@ fn load_list(dir: &Path) -> Option<Vec<Node>> {
     // Only the ids are read here. Visibility describes the node that *owns* a
     // list, and a list cannot see its owner, so `load_visibility` stitches it
     // on afterwards from the top down.
-    let meta = read_listmeta(dir);
+    let meta = read_header(dir);
 
     let mut positions: Vec<usize> = Vec::new();
     for entry in std::fs::read_dir(dir).ok()? {
@@ -170,14 +179,14 @@ fn assign_missing_ids(tree: &mut Tree) {
     tree.reseat_counter();
 }
 
-/// Read each top-level note's visibility from its own folder's `.listmeta`.
+/// Read each top-level note's visibility from its own folder's `.header`.
 ///
 /// Separate from `load_list` because visibility describes the *owner* of a
 /// list, and a list does not know who owns it.
 pub fn load_visibility(root: &Path, tree: &mut Tree) {
     for (i, note) in tree.notes.iter_mut().enumerate() {
         let dir = root.join(child_dir_name(i + 1));
-        let v = read_listmeta(&dir)
+        let v = read_header(&dir)
             .and_then(|m| m.visibility)
             .map(|s| Visibility::parse(&s));
         note.visibility = Some(v.unwrap_or(Visibility::Private));
@@ -191,7 +200,7 @@ pub fn load_visibility(root: &Path, tree: &mut Tree) {
 /// Write the tree to `root`, reconciling rather than rewriting.
 ///
 /// For each directory: write what changed, create what is missing, remove what
-/// is no longer in the tree. An unchanged subtree costs one `.listmeta` read,
+/// is no longer in the tree. An unchanged subtree costs one `.header` read,
 /// because the stored hash is enough to know its contents already match.
 pub fn save_tree(root: &Path, tree: &Tree) -> std::io::Result<()> {
     std::fs::create_dir_all(root)?;
@@ -216,7 +225,7 @@ fn save_list(
     // does not see the whole tree change on every keystroke.
     let want_visibility = visibility.map(|v| v.as_str().to_owned());
 
-    let mut keep: Vec<String> = vec![LISTMETA.to_owned()];
+    let mut keep: Vec<String> = vec![HEADER.to_owned()];
     let mut children_meta = Vec::with_capacity(nodes.len());
 
     for (i, node) in nodes.iter().enumerate() {
@@ -271,13 +280,18 @@ fn save_list(
         }
     }
 
-    let meta = ListMeta {
+    let meta = ListHeader {
         sha256: own_hash.to_owned(),
         visibility: want_visibility,
         children: children_meta,
     };
     let json = serde_json::to_string_pretty(&meta).unwrap_or_default();
-    write_if_changed(&dir.join(LISTMETA), &json)
+    write_if_changed(&dir.join(HEADER), &json)?;
+    // Only once the `.header` is written, so a list is never without one.
+    match std::fs::remove_file(dir.join(LEGACY_HEADER)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Write only when the bytes differ, so an untouched note keeps its mtime and a
