@@ -78,7 +78,7 @@ pub const CMD_DUPLICATE: &str = "duplicate";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Segment {
     Node(NodeId),
-    /// The `header:` row, which is rendered rather than a node. Its token is
+    /// The `header` row, which is rendered rather than a node. Its token is
     /// still `m`, from when it was called the list meta: the app keeps paths.
     Header,
 }
@@ -312,7 +312,7 @@ impl NotesProvider {
         }
     }
 
-    /// The `header:` row for the current level.
+    /// The `header` row for the current level.
     ///
     /// Its key must stay localized, and must therefore never be literally
     /// `"meta"`: the app special-cases an Obj keyed exactly `"meta"` and skips
@@ -1080,7 +1080,7 @@ mod tests {
 
     /// The rows the provider currently renders for this level, verbatim — what
     /// the app would hand back unchanged if the user changed nothing. Includes
-    /// the `header:` row, because the app hands that back too.
+    /// the `header` row, because the app hands that back too.
     fn rows(p: &mut NotesProvider) -> Vec<FfonElement> {
         p.fetch()
     }
