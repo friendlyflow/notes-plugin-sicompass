@@ -16,7 +16,8 @@
   ],
   "service": {
     "tier": "friendlyflow/cloud",
-    "what": "notes-service"
+    "what": "notes-service",
+    "switch": "notesCloudBackup"
   },
   "permissions": {
     "storage": true,

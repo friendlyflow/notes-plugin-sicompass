@@ -1,6 +1,8 @@
 //! Cloud sync of the notes, through Sicompass Cloud.
 //!
-//! Off until the user ticks "enable cloud sync" in the notes settings. The
+//! Switched by "enable cloud sync" in the notes settings, the row
+//! `plugin.json` names as its service's `switch`: the app shows it only while
+//! the user holds Sicompass Cloud, and the Store ticks it when they pay. The
 //! service itself (the switch, a sync a while after the last change, every
 //! minute and on demand, as background tasks, and the merge of what another
 //! computer changed) is `sicompass_sync::cloud`, the same one a third party's
