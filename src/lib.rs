@@ -8,7 +8,8 @@
 //! # Two invariants, both easy to break by accident
 //!
 //! 1. **Every row is escaped.** The app parses `<input>`, `<button>`, `<link>`
-//!    and friends out of *any* string it renders, so a note titled
+//!    and friends out of *any* string it renders, and with `"markup": true` in
+//!    `plugin.json` the HTML-named tags and `<style>` rows too, so a note titled
 //!    `<button>x</button>` would grow a live control that runs on Enter. Note
 //!    text is the most user-controlled string in the app; it goes through
 //!    [`escape::escape`] before it becomes a label, always.
@@ -1633,24 +1634,17 @@ mod tests {
         assert_eq!(p.tree.notes[0].text, "<button>wipe</button>Click me");
     }
 
-    /// A known cosmetic limitation of the SDK, pinned here so it is a decision
-    /// rather than a surprise.
-    ///
-    /// `tags::strip_display` unescapes partway through and then re-scans what it
-    /// just unescaped (the `<id>` arm ends in
-    /// `strip_display(&unescape(&result))`), so an escaped tag survives one pass
-    /// and is stripped on the next. The note is inert either way — nothing
-    /// becomes a live control — but the user reads "Click me" rather than the
-    /// angle brackets they typed. `lib_gitclient` has the same behaviour for
-    /// diff lines. Fixing it means deferring the unescape to the final return
-    /// in the SDK, which changes rendering for every provider and belongs in its
-    /// own change.
+    /// A note that looks like a tag is read as what the user typed, and is never a
+    /// live control.
     #[test]
-    fn a_tag_shaped_note_reads_back_without_its_tag() {
+    fn a_tag_shaped_note_reads_back_as_typed() {
         let d = TempDir::new().unwrap();
         let mut p = provider(&d);
         sync(&mut p, vec![new_row("<button>wipe</button>Click me")]);
-        assert_eq!(note_labels(&p.fetch()), vec!["Click me"]);
+        assert_eq!(
+            note_labels(&p.fetch()),
+            vec!["<button>wipe</button>Click me"]
+        );
     }
 
     #[test]
@@ -1666,6 +1660,204 @@ mod tests {
         assert_eq!(p.tree.notes[0].id, real_id);
         assert_eq!(p.tree.notes[1].text, "<id>1</id>impostor");
         assert_ne!(p.tree.notes[1].id, real_id);
+    }
+
+    // ---- Markup --------------------------------------------------------------
+    //
+    // `plugin.json` says `"markup": true`, so the app reads the HTML-named tags
+    // and `<style>` rows in what this plugin sends. A note is none of those.
+
+    /// Text that would be live if it reached a row as written.
+    const HOSTILE: [&str; 6] = [
+        "<b>x</b>",
+        r#"<img src="/etc/passwd">"#,
+        "<style>li { color: red }</style>",
+        "<input>y</input>",
+        "<button>go</button>",
+        r"ends in a backslash\",
+    ];
+
+    /// A row as the app holds it after the user types `text`: in a list of
+    /// markup it escapes what was typed (`handlers::typed_for_row`).
+    fn typed_row(text: &str) -> FfonElement {
+        FfonElement::Str(tags::format_input(&tags::escape(text)))
+    }
+
+    /// The raw row of the one note in a list that opens with its header.
+    fn only_note_row(p: &mut NotesProvider) -> String {
+        labels_raw(&p.fetch())
+            .into_iter()
+            .find(|r| tags::has_id(r) || tags::extract_id(r).is_some())
+            .expect("a note row")
+    }
+
+    fn assert_inert(raw: &str) {
+        assert!(!sicompass_sdk::markup::has_markup(raw), "markup in {raw}");
+        assert!(sicompass_sdk::markup::targets(raw).is_empty(), "{raw}");
+        assert!(tags::targets(raw).is_empty(), "{raw}");
+        assert!(!tags::has_button(raw), "{raw}");
+        assert!(!tags::has_link(raw), "{raw}");
+        assert!(!tags::has_image(raw), "{raw}");
+        assert!(sicompass_sdk::markup::style_sheet(raw).is_none(), "{raw}");
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../plugin.json")).unwrap();
+        assert_eq!(manifest["markup"], serde_json::json!(true));
+    }
+
+    /// The row is inert, and what the edit field opens with is the original: the
+    /// app fills it with `strip_display(extract_input(row))`.
+    #[test]
+    fn hostile_text_in_a_note_stays_text() {
+        for text in HOSTILE {
+            let d = TempDir::new().unwrap();
+            let mut p = provider(&d);
+            sync(&mut p, vec![typed_row(text)]);
+            assert_eq!(p.tree.notes[0].text, text, "stored");
+
+            let raw = only_note_row(&mut p);
+            assert_inert(&raw);
+            let field = tags::extract_input(&raw).expect("the note's field");
+            assert_eq!(tags::strip_display(&field), text, "edit field of {raw}");
+        }
+    }
+
+    /// The same text as a branch, whose row is the key of an object and comes
+    /// back as the parent key when the app refreshes it.
+    #[test]
+    fn hostile_text_in_a_branch_stays_text_and_can_be_entered() {
+        for text in HOSTILE {
+            let d = TempDir::new().unwrap();
+            let mut p = provider(&d);
+            let raw_row = FfonElement::new_obj(tags::format_input(&tags::escape(text)));
+            sync(&mut p, vec![raw_row]);
+
+            let raw = only_note_row(&mut p);
+            assert_inert(&raw);
+
+            // The app pushes what `strip_display` gives, whatever that is.
+            p.fetch();
+            p.push_path(&tags::strip_display(&raw));
+            assert_eq!(p.current_path(), format!("/n{}", p.tree.notes[0].id));
+            assert_eq!(p.fetch_subtree_parent_key().as_deref(), Some(raw.as_str()));
+        }
+    }
+
+    /// Whole-row display, which goes through the `<id>` arm of `strip_display`.
+    /// Tags `strip_display` does not know come through as written.
+    #[test]
+    fn a_whole_row_shows_markup_shaped_text_as_written() {
+        for text in &HOSTILE[..3] {
+            let d = TempDir::new().unwrap();
+            let mut p = provider(&d);
+            sync(&mut p, vec![typed_row(text)]);
+            let raw = only_note_row(&mut p);
+            assert_eq!(tags::strip_display(&raw), *text, "{raw}");
+        }
+    }
+
+    /// A whole row with an `<id>` reads as what was typed, and stays inert.
+    #[test]
+    fn a_whole_row_with_an_id_reads_as_it_was_typed() {
+        for text in [
+            "<input>y</input>",
+            "<button>go</button>",
+            r"ends in a backslash\",
+            r"a\<b",
+        ] {
+            let d = TempDir::new().unwrap();
+            let mut p = provider(&d);
+            sync(&mut p, vec![typed_row(text)]);
+            assert_eq!(p.tree.notes[0].text, text, "stored intact");
+            let raw = only_note_row(&mut p);
+            assert_inert(&raw);
+            assert_eq!(tags::strip_display(&raw), text, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_value_ending_in_a_backslash_is_an_input() {
+        let raw = NotesProvider::row_label(&Node {
+            id: 1,
+            text: r"C:\notes\".to_owned(),
+            is_branch: false,
+            children: Vec::new(),
+            visibility: None,
+        });
+        assert!(tags::has_input(&raw), "{raw}");
+        assert_eq!(tags::extract_input(&raw).as_deref(), Some(r"C:\notes\"));
+        assert_eq!(row_text(&raw), r"C:\notes\");
+    }
+
+    /// Nothing typed, and the app hands the rows back: not one byte moves, here
+    /// or on disk, and no second round adds a backslash.
+    #[test]
+    fn handing_rows_back_never_changes_a_note() {
+        for text in HOSTILE.into_iter().chain([r"a\<b", r"\\<", r"a\>"]) {
+            let d = TempDir::new().unwrap();
+            let mut p = provider(&d);
+            sync(&mut p, vec![typed_row(text)]);
+            let hash = p.tree.root_hash_hex();
+            for _ in 0..3 {
+                let rows = rows(&mut p);
+                sync(&mut p, rows);
+                assert_eq!(p.tree.notes[0].text, text);
+            }
+            assert_eq!(p.tree.root_hash_hex(), hash);
+
+            let mut q = provider(&d);
+            q.fetch();
+            assert_eq!(q.tree.notes[0].text, text, "after a reload");
+            assert_eq!(
+                std::fs::read(d.path().join("notes").join("0001")).unwrap(),
+                text.as_bytes(),
+                "on disk"
+            );
+        }
+    }
+
+    /// An edit: `commit_edit` gets `old` as written and `new` as typed, and then
+    /// the list, the row rewritten the way the app rewrites it (prefix + field).
+    #[test]
+    fn editing_a_note_to_hostile_text_and_back_keeps_the_original_bytes() {
+        let d = TempDir::new().unwrap();
+        let mut p = provider(&d);
+        sync(&mut p, vec![new_row("plain")]);
+        let mut previous = "plain".to_owned();
+        for text in HOSTILE.into_iter().chain(["plain"]) {
+            let raw = only_note_row(&mut p);
+            let old = tags::extract_input(&raw).unwrap();
+            assert_eq!(old, tags::escape(&previous), "old is what was written");
+            assert!(p.commit_edit(&old, text));
+            let prefix = tags::format_id(&p.tree.notes[0].id.to_string());
+            let edited = format!("{prefix}{}", tags::format_input(&tags::escape(text)));
+            sync(
+                &mut p,
+                vec![
+                    FfonElement::new_obj(localize::t("notes-header")),
+                    FfonElement::Str(edited),
+                ],
+            );
+            assert_eq!(p.tree.notes.len(), 1);
+            assert_eq!(p.tree.notes[0].text, text);
+            previous = text.to_owned();
+        }
+    }
+
+    /// A new note: `new` is what was typed, plain, and it is what gets stored,
+    /// with no escaping and no tag taken for one.
+    #[test]
+    fn a_new_note_keeps_the_bytes_that_were_typed() {
+        for text in HOSTILE {
+            let d = TempDir::new().unwrap();
+            let mut p = provider(&d);
+            assert!(p.commit_edit("", text));
+            sync(&mut p, vec![typed_row(text)]);
+            assert_eq!(p.tree.notes[0].text, text);
+        }
     }
 
     // ---- The store -------------------------------------------------------
