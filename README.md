@@ -5,7 +5,7 @@
 This plugin is part of [Sicompass](https://github.com/friendlyflow/sicompass), a
 keyboard-first, accessibility-first way to use your entire computer.
 
-Notes is a tree of lists you write in. A note can hold a list of its own, which
+Notes is a hierarchy you write in. A note can hold a list of its own, which
 can hold more lists, as deep as you like. You add, rename, move, cut and paste
 notes with the same keys as everywhere else in Sicompass, and every change can
 be undone.
